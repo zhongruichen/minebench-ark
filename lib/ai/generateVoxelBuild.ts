@@ -1,0 +1,1459 @@
+import type { BlockDefinition } from "@/lib/blocks/palettes";
+import { getPalette } from "@/lib/blocks/palettes";
+import { extractBestVoxelBuildJson, extractFirstJsonObject } from "@/lib/ai/jsonExtract";
+import { modelOutputCeiling, modelUsesDefaultSampling } from "@/lib/ai/modelRequestProfiles";
+import { buildRepairPrompt, buildSystemPrompt, buildUserPrompt } from "@/lib/ai/prompts";
+import { getModelByKey, ModelKey, ModelCatalogEntry } from "@/lib/ai/modelCatalog";
+import { makeVoxelBuildJsonSchema } from "@/lib/ai/voxelBuildJsonSchema";
+import { anthropicGenerateText } from "@/lib/ai/providers/anthropic";
+import { deepseekGenerateText } from "@/lib/ai/providers/deepseek";
+import { geminiGenerateText } from "@/lib/ai/providers/gemini";
+import { minimaxGenerateText } from "@/lib/ai/providers/minimax";
+import { metaGenerateText } from "@/lib/ai/providers/meta";
+import { moonshotGenerateText } from "@/lib/ai/providers/moonshot";
+import { openAiCompatibleGenerateText } from "@/lib/ai/providers/openaiCompatible";
+import {
+  customGatewayGenerateText,
+  normalizeCustomReasoningEffort,
+} from "@/lib/ai/providers/customGateway";
+import { openaiGenerateText } from "@/lib/ai/providers/openai";
+import { openrouterGenerateText } from "@/lib/ai/providers/openrouter";
+import { xaiGenerateText } from "@/lib/ai/providers/xai";
+import { zaiGenerateText } from "@/lib/ai/providers/zai";
+import {
+  AnthropicAdaptiveEffort,
+  anthropicAdaptiveEffortAttempts,
+  DeepSeekThinkingConfig,
+  deepseekThinkingConfigForModel,
+  GeminiThinkingConfig,
+  geminiThinkingConfigForModel,
+  MoonshotThinkingConfig,
+  moonshotThinkingConfigForModel,
+  metaReasoningEffortAttempts,
+  modelRequiresReasoning,
+  openAiReasoningEffortAttempts,
+  openRouterReasoningEnabledForModel,
+  openRouterReasoningEffortAttempts as openRouterReasoningEffortAttemptsForModel,
+  xaiAutomaticReasoningForModel,
+  xaiReasoningEffortAttempts,
+  zaiReasoningEffortAttempts,
+} from "@/lib/ai/reasoningProfiles";
+import {
+  parseVoxelBuildSpec,
+  validateVoxelBuild,
+  validateVoxelBuildSpec,
+} from "@/lib/voxel/validate";
+import type { VoxelBuild } from "@/lib/voxel/types";
+import { MAX_BLOCKS_BY_GRID, MIN_BLOCKS_BY_GRID } from "@/lib/ai/limits";
+import type {
+  AcceptedProviderRequestConfiguration,
+  AcceptedRequestConfigurationRecord,
+  ProviderApiKeys,
+  ProviderTelemetryCallbacks,
+} from "@/lib/ai/types";
+import { DEFAULT_MAX_OUTPUT_TOKENS } from "@/lib/ai/tokenBudgets";
+import {
+  runVoxelExec,
+  VOXEL_EXEC_TOOL_NAME,
+  voxelExecToolCallJsonSchema,
+  voxelExecToolCallSchema,
+} from "@/lib/ai/tools/voxelExec";
+import { getErrorMessage } from "@/lib/errorMessage";
+
+const INT_ENV_MAX_OUTPUT_TOKENS = "MINEBENCH_MAX_OUTPUT_TOKENS";
+const MAX_EXPLICIT_OUTPUT_TOKENS = 1_000_000;
+
+function parseOptionalIntEnvVar(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function boundedExplicitMaxOutputTokens(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.min(Math.floor(value), MAX_EXPLICIT_OUTPUT_TOKENS);
+}
+
+function defaultMaxOutputTokens(
+  _gridSize: 64 | 256 | 512,
+  modelId: string,
+  explicitMaxOutputTokens?: number,
+): number {
+  const ceiling = modelOutputCeiling(modelId);
+  const requested =
+    boundedExplicitMaxOutputTokens(explicitMaxOutputTokens) ??
+    parseOptionalIntEnvVar(INT_ENV_MAX_OUTPUT_TOKENS) ??
+    ceiling ??
+    DEFAULT_MAX_OUTPUT_TOKENS;
+  return ceiling === undefined ? requested : Math.min(requested, ceiling);
+}
+
+function defaultMaxReasoningTokens(modelId: string, maxOutputTokens: number): number | undefined {
+  // For GPT OSS, max_output_tokens is a combined completion/reasoning budget.
+  // Use the model's full output budget as the requested reasoning budget.
+  if (modelId === "gpt-oss-120b") return maxOutputTokens;
+  if (modelId === "claude-sonnet-4-6") return Math.max(1024, maxOutputTokens - 1);
+  return undefined;
+}
+
+function approxMaxBlocksForTokenBudget(opts: {
+  maxOutputTokens: number;
+  minBlocks: number;
+  hardMax: number;
+}): number {
+  // rough heuristic: each block entry costs ~10-20 tokens depending on provider + whitespace
+  // use 12 to allow more detail while still reducing truncation risk
+  const est = Math.floor(opts.maxOutputTokens / 12);
+  return Math.max(opts.minBlocks, Math.min(opts.hardMax, est));
+}
+
+const DEFAULT_TEMPERATURE = 1.0;
+
+function formatOptionalInteger(value: number | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+  return String(Math.floor(value));
+}
+
+function acceptedProviderRequestConfigurationLine(
+  configuration: AcceptedProviderRequestConfiguration,
+): string {
+  return (
+    `Request config: api_mode=${configuration.apiMode}, ` +
+    `max_output_tokens=${configuration.maxOutputTokens}, ` +
+    `reasoning_max_tokens=${formatOptionalInteger(configuration.reasoningMaxTokens)}, ` +
+    `thinking_mode=${configuration.thinkingMode}, ` +
+    `temperature=${configuration.temperature}, ` +
+    `text_verbosity=${configuration.textVerbosity}, ` +
+    `response_format=${configuration.responseFormat}.`
+  );
+}
+
+function describeRequestedThinkingMode(opts: {
+  route: "direct" | "openrouter";
+  provider: DirectProvider | "openrouter";
+  modelId: string;
+  reasoningMaxTokens?: number;
+  reasoningEffortAttempts?: string[];
+  adaptiveEffortAttempts?: AnthropicAdaptiveEffort[];
+  geminiThinkingConfig?: GeminiThinkingConfig;
+  moonshotThinkingConfig?: MoonshotThinkingConfig;
+  deepseekThinkingConfig?: DeepSeekThinkingConfig;
+  reasoningRequired?: boolean;
+}): string {
+  if (opts.route === "openrouter") {
+    if (opts.modelId === "x-ai/grok-4.3") return "automatic";
+    if (opts.reasoningEffortAttempts && opts.reasoningEffortAttempts.length > 0) {
+      const finalFallback = opts.reasoningRequired ? "" : "->disabled";
+      return `effort_fallback=${opts.reasoningEffortAttempts.join("->")}${finalFallback}`;
+    }
+    if (typeof opts.reasoningMaxTokens === "number") {
+      return `reasoning_max_tokens<=${Math.floor(opts.reasoningMaxTokens)}`;
+    }
+    return "default";
+  }
+
+  if (opts.provider === "gemini") {
+    if (opts.geminiThinkingConfig?.thinkingLevel) {
+      return `thinking_level=${opts.geminiThinkingConfig.thinkingLevel}`;
+    }
+    if (typeof opts.geminiThinkingConfig?.thinkingBudget === "number") {
+      return `thinking_budget=${opts.geminiThinkingConfig.thinkingBudget}`;
+    }
+    return "default";
+  }
+
+  if (opts.provider === "deepseek") {
+    if (!opts.deepseekThinkingConfig) return "default";
+    if (opts.deepseekThinkingConfig.type === "disabled") return "thinking=disabled";
+    return `thinking=${opts.deepseekThinkingConfig.reasoningEffort ?? "high"}`;
+  }
+  if (opts.provider === "xai") {
+    if (opts.reasoningEffortAttempts && opts.reasoningEffortAttempts.length > 0) {
+      return `reasoning_effort=${opts.reasoningEffortAttempts[0]}`;
+    }
+    return "automatic";
+  }
+  if (opts.provider === "moonshot") {
+    if (opts.moonshotThinkingConfig?.reasoningEffort) {
+      return `reasoning_effort=${opts.moonshotThinkingConfig.reasoningEffort}`;
+    }
+    return opts.moonshotThinkingConfig?.type
+      ? `thinking=${opts.moonshotThinkingConfig.type}`
+      : "default";
+  }
+  if (opts.provider === "minimax") return "default";
+  if (opts.provider === "custom") return "default";
+
+  if (opts.provider === "meta" || opts.provider === "zai") {
+    if (opts.reasoningEffortAttempts && opts.reasoningEffortAttempts.length > 0) {
+      return `reasoning_effort=${opts.reasoningEffortAttempts[0]}`;
+    }
+    return "default";
+  }
+
+  if (opts.provider === "openai") {
+    const usesProReasoning = opts.modelId.startsWith("gpt-5.6");
+    const reasoningMode = usesProReasoning
+      ? "reasoning_mode=pro,"
+      : "";
+    const finalFallback = usesProReasoning ? "pro-default" : "disabled";
+    if (opts.reasoningEffortAttempts && opts.reasoningEffortAttempts.length > 0) {
+      return `${reasoningMode}reasoning_effort_fallback=${opts.reasoningEffortAttempts.join("->")}->${finalFallback}`;
+    }
+    if (typeof opts.reasoningMaxTokens === "number") {
+      return `${reasoningMode}reasoning_max_tokens<=${Math.floor(opts.reasoningMaxTokens)}`;
+    }
+    return reasoningMode ? "reasoning_mode=pro" : "default";
+  }
+
+  if (opts.provider === "anthropic") {
+    if (opts.adaptiveEffortAttempts && opts.adaptiveEffortAttempts.length > 0) {
+      return `adaptive_effort=${opts.adaptiveEffortAttempts.join("->")}`;
+    }
+    if (opts.modelId.startsWith("claude")) return "adaptive_or_default";
+    if (typeof opts.reasoningMaxTokens === "number") {
+      return `thinking_budget<=${Math.floor(opts.reasoningMaxTokens)}`;
+    }
+    return "default";
+  }
+
+  if (typeof opts.reasoningMaxTokens === "number") {
+    return `reasoning_max_tokens<=${Math.floor(opts.reasoningMaxTokens)}`;
+  }
+  return "default";
+}
+
+function providerRequestTraceLine(opts: {
+  route: "direct" | "openrouter";
+  provider: DirectProvider | "openrouter";
+  modelId: string;
+  maxOutputTokens: number;
+  reasoningMaxTokens?: number;
+  reasoningEffortAttempts?: string[];
+  openRouterReasoningEnabled?: boolean;
+  adaptiveEffortAttempts?: AnthropicAdaptiveEffort[];
+  geminiThinkingConfig?: GeminiThinkingConfig;
+  moonshotThinkingConfig?: MoonshotThinkingConfig;
+  deepseekThinkingConfig?: DeepSeekThinkingConfig;
+  reasoningRequired?: boolean;
+}): string {
+  const thinkingMode =
+    opts.route === "openrouter" && opts.openRouterReasoningEnabled
+      ? "enabled"
+      : describeRequestedThinkingMode(opts);
+  const temperature =
+    opts.route === "direct" &&
+    opts.provider === "deepseek" &&
+    opts.deepseekThinkingConfig?.type === "enabled"
+      ? "n/a"
+      : opts.route === "direct" && opts.provider === "moonshot"
+      ? opts.modelId === "kimi-k3"
+        ? "default"
+        : opts.modelId === "kimi-k2.6" || opts.modelId === "kimi-k2.5"
+        ? opts.moonshotThinkingConfig?.type === "disabled"
+          ? 0.6
+          : 1.0
+        : 0.6
+      : opts.route === "direct" && opts.provider === "gemini" && opts.modelId.startsWith("gemini-3")
+      ? "default"
+      : modelUsesDefaultSampling(opts.modelId)
+      ? "default"
+      : DEFAULT_TEMPERATURE;
+  return `Request config: max_output_tokens=${Math.floor(opts.maxOutputTokens)}, reasoning_max_tokens=${formatOptionalInteger(opts.reasoningMaxTokens)}, thinking_mode=${thinkingMode}, temperature=${temperature}.`;
+}
+
+type DirectProvider = ModelCatalogEntry["provider"] | "custom";
+
+type ResolvedModel = {
+  key: string;
+  provider: DirectProvider;
+  modelId: string;
+  displayName: string;
+  openRouterModelId?: string;
+  forceOpenRouter?: boolean;
+  importOnly?: boolean;
+  baseUrl?: string;
+  requireStructuredOutput?: boolean;
+  /** Use the locked-envelope custom gateway adapter. */
+  customGatewayMode?: boolean;
+  customGatewayStructuredOutput?: boolean;
+  conversationId?: string;
+  userAgent?: string;
+};
+
+function isBilledTimeoutStyleProviderError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("und_err_headers_timeout") ||
+    m.includes("headerstimeouterror") ||
+    m.includes("headers timeout") ||
+    m.includes("openai request timed out") ||
+    m.includes("anthropic request timed out") ||
+    m.includes("request timed out") ||
+    (m.includes("openai request failed") && m.includes("timeout")) ||
+    (m.includes("anthropic request failed") && m.includes("timeout"))
+  );
+}
+
+function isExhaustedOutputBudgetProviderError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("status incomplete: max_output_tokens") ||
+    m.includes("ended with status incomplete: max_output_tokens")
+  );
+}
+
+function isDeterministicStructuredSchemaProviderError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("output_config.format.schema") ||
+    (m.includes("json_schema") && m.includes("not supported")) ||
+    (m.includes("structured output") && m.includes("not supported")) ||
+    (m.includes("structured output") && m.includes("invalid"))
+  );
+}
+
+function isDeterministicProviderPreflightError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.startsWith("missing ") ||
+    m.includes("no openrouter api key is available") ||
+    m.includes("does not support reasoning") ||
+    m.includes("does not expose a reasoning") ||
+    m.includes("does not expose an adaptive effort") ||
+    m.includes("does not expose a thinking override") ||
+    m.includes("reasons automatically and does not support") ||
+    m.includes("routing is unavailable") ||
+    m.includes("not integrated with openrouter") ||
+    m.includes("no openrouter model id configured") ||
+    m.includes("direct api not supported") ||
+    m.includes("fail-closed reasoning") ||
+    m.includes("invalid custom api server url") ||
+    m.includes("custom api server url must ") ||
+    m.includes("custom api server url is missing a hostname") ||
+    m.includes("custom api server url resolved to a private or loopback address")
+  );
+}
+
+function normalizeApiKey(raw: string | undefined): string | null {
+  const stripQuotes = (value: string) => {
+    const first = value[0];
+    return value.length >= 2 && (first === '"' || first === "'") && value.at(-1) === first
+      ? value.slice(1, -1).trim()
+      : value;
+  };
+  const unquoted = stripQuotes((raw ?? "").trim());
+  const key = stripQuotes(unquoted.replace(/^Bearer\s+/i, "").trim());
+  return key || null;
+}
+
+type ProviderKeyName =
+  | "openai"
+  | "anthropic"
+  | "gemini"
+  | "moonshot"
+  | "deepseek"
+  | "minimax"
+  | "xai"
+  | "meta"
+  | "zai"
+  | "openrouter"
+  | "custom";
+
+function envVarForProviderKey(provider: ProviderKeyName): string {
+  switch (provider) {
+    case "openai":
+      return "OPENAI_API_KEY";
+    case "anthropic":
+      return "ANTHROPIC_API_KEY";
+    case "gemini":
+      return "GOOGLE_AI_API_KEY";
+    case "moonshot":
+      return "MOONSHOT_API_KEY";
+    case "deepseek":
+      return "DEEPSEEK_API_KEY";
+    case "minimax":
+      return "MINIMAX_API_KEY";
+    case "xai":
+      return "XAI_API_KEY";
+    case "meta":
+      return "META_MODEL_API_KEY";
+    case "zai":
+      return "ZAI_API_KEY";
+    case "openrouter":
+      return "OPENROUTER_API_KEY";
+    case "custom":
+      return "CUSTOM_API_KEY";
+  }
+}
+
+function envVarForDirectProvider(provider: DirectProvider): string | null {
+  switch (provider) {
+    case "openai":
+      return envVarForProviderKey("openai");
+    case "anthropic":
+      return envVarForProviderKey("anthropic");
+    case "gemini":
+      return envVarForProviderKey("gemini");
+    case "moonshot":
+      return envVarForProviderKey("moonshot");
+    case "deepseek":
+      return envVarForProviderKey("deepseek");
+    case "minimax":
+      return envVarForProviderKey("minimax");
+    case "xai":
+      return envVarForProviderKey("xai");
+    case "meta":
+      return envVarForProviderKey("meta");
+    case "zai":
+      return envVarForProviderKey("zai");
+    case "custom":
+      return envVarForProviderKey("custom");
+    default:
+      return null;
+  }
+}
+
+function serverApiKey(provider: ProviderKeyName): string | null {
+  const envVar = envVarForProviderKey(provider);
+  return normalizeApiKey(process.env[envVar]);
+}
+
+function effectiveApiKey(opts: {
+  provider: DirectProvider | "openrouter";
+  providerKeys?: ProviderApiKeys;
+  allowServerKeys: boolean;
+}): string | null {
+  const provider = opts.provider;
+  if (provider === "qwen") return null; // only supported via OpenRouter fallback
+
+  const directKey = normalizeApiKey(
+    provider === "openrouter"
+      ? opts.providerKeys?.openrouter
+      : provider === "openai"
+        ? opts.providerKeys?.openai
+        : provider === "anthropic"
+          ? opts.providerKeys?.anthropic
+          : provider === "gemini"
+            ? opts.providerKeys?.gemini
+            : provider === "moonshot"
+              ? opts.providerKeys?.moonshot
+              : provider === "deepseek"
+                ? opts.providerKeys?.deepseek
+                : provider === "minimax"
+                  ? opts.providerKeys?.minimax
+                  : provider === "xai"
+                    ? opts.providerKeys?.xai
+                    : provider === "meta"
+                      ? opts.providerKeys?.meta
+                      : provider === "zai"
+                        ? opts.providerKeys?.zai
+                        : provider === "custom"
+                          ? opts.providerKeys?.custom
+                          : undefined,
+  );
+  if (directKey) return directKey;
+
+  if (!opts.allowServerKeys) return null;
+
+  if (provider === "openrouter") return serverApiKey("openrouter");
+  if (provider === "openai") return serverApiKey("openai");
+  if (provider === "anthropic") return serverApiKey("anthropic");
+  if (provider === "gemini") return serverApiKey("gemini");
+  if (provider === "moonshot") return serverApiKey("moonshot");
+  if (provider === "deepseek") return serverApiKey("deepseek");
+  if (provider === "minimax") return serverApiKey("minimax");
+  if (provider === "xai") return serverApiKey("xai");
+  if (provider === "meta") return serverApiKey("meta");
+  if (provider === "zai") return serverApiKey("zai");
+  if (provider === "custom") return serverApiKey("custom");
+
+  return null;
+}
+
+export type GenerateVoxelBuildParams = {
+  modelKey?: ModelKey;
+  model?: {
+    key: string;
+    provider: DirectProvider;
+    modelId: string;
+    displayName: string;
+    openRouterModelId?: string;
+    forceOpenRouter?: boolean;
+    importOnly?: boolean;
+    baseUrl?: string;
+    requireStructuredOutput?: boolean;
+    customGatewayMode?: boolean;
+    customGatewayStructuredOutput?: boolean;
+    conversationId?: string;
+    userAgent?: string;
+  };
+  prompt: string;
+  gridSize: 64 | 256 | 512;
+  palette: "simple" | "advanced";
+  maxAttempts?: number;
+  maxOutputTokens?: number;
+  enableTools?: boolean;
+  providerKeys?: ProviderApiKeys;
+  allowServerKeys?: boolean;
+  preferOpenRouter?: boolean;
+  reasoning?: string;
+  abortSignal?: AbortSignal;
+  // Fired immediately before every outbound generation request
+  onProviderRequest?: (attempt: number) => void;
+  onRetry?: (attempt: number, reason: string) => unknown;
+  // Fired after response text returns and before parsing or execution
+  onRawResponse?: (attempt: number, rawText: string) => void;
+  onDelta?: (delta: string) => void;
+  /** Chain-of-thought stream, separate from the JSON payload. */
+  onReasoningDelta?: (delta: string) => void;
+  /** Token usage reported by the provider (include_usage). */
+  onUsage?: (usage: import("@/lib/ai/providers/customGateway").CustomUsage) => void;
+  onProviderTrace?: (message: string) => void;
+  acquireBuildProcessing?: () => Promise<() => void>;
+  returnExpandedBuild?: boolean;
+};
+
+export type GenerateVoxelBuildResult =
+  | {
+      ok: true;
+      build: VoxelBuild;
+      warnings: string[];
+      blockCount: number;
+      generationTimeMs: number;
+      acceptedOutputTokens?: number;
+      providerRoute?: "direct" | "openrouter";
+      requestConfiguration?: string;
+      acceptedRequestConfiguration?: AcceptedRequestConfigurationRecord;
+      rawText: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      rawText?: string;
+      generationTimeMs: number;
+      acceptedOutputTokens?: number;
+      providerRoute?: "direct" | "openrouter";
+      requestConfiguration?: string;
+      acceptedRequestConfiguration?: AcceptedRequestConfigurationRecord;
+    };
+
+// call the direct provider (OpenAI, Anthropic, etc.)
+async function callDirectProvider(args: {
+  provider:
+    | "openai"
+    | "anthropic"
+    | "gemini"
+    | "moonshot"
+    | "deepseek"
+    | "custom"
+    | "xai"
+    | "zai"
+    | "qwen"
+    | "minimax"
+    | "meta";
+  modelId: string;
+  apiKey?: string;
+  baseUrl?: string;
+  requireStructuredOutput?: boolean;
+  /** Route custom provider through the locked-envelope gateway adapter. */
+  customGatewayMode?: boolean;
+  /** Send response_format=json_schema on the gateway path (off by default). */
+  customGatewayStructuredOutput?: boolean;
+  conversationId?: string;
+  userAgent?: string;
+  onReasoningDelta?: (delta: string) => void;
+  onUsage?: (usage: import("@/lib/ai/providers/customGateway").CustomUsage) => void;
+  system: string;
+  user: string;
+  jsonSchema: Record<string, unknown>;
+  maxOutputTokens: number;
+  reasoningMaxTokens?: number;
+  reasoningEffort?: string;
+  reasoningEffortAttempts?: string[];
+  adaptiveEffortAttempts?: AnthropicAdaptiveEffort[];
+  geminiThinkingConfig?: GeminiThinkingConfig;
+  moonshotThinkingConfig?: MoonshotThinkingConfig;
+  deepseekThinkingConfig?: DeepSeekThinkingConfig;
+  signal?: AbortSignal;
+  onDelta?: (delta: string) => void;
+  onTrace?: (message: string) => void;
+  onAcceptedOutputTokens?: (tokens: number) => void;
+} & ProviderTelemetryCallbacks): Promise<{ text: string }> {
+  if (args.provider === "openai") {
+    return openaiGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      reasoningMaxTokens: args.reasoningMaxTokens,
+      reasoningEffortAttempts: args.reasoningEffortAttempts,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "anthropic") {
+    return anthropicGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxTokens: args.maxOutputTokens,
+      adaptiveEffortAttempts: args.adaptiveEffortAttempts,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "gemini") {
+    return geminiGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      thinkingConfig: args.geminiThinkingConfig,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "moonshot") {
+    return moonshotGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      jsonSchema: args.jsonSchema,
+      thinkingConfig: args.moonshotThinkingConfig,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "deepseek") {
+    return deepseekGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      thinkingConfig: args.deepseekThinkingConfig,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "custom") {
+    // Locked-envelope gateways (thinking always on, max_tokens pinned, no
+    // structured output) go through the dedicated adapter.
+    if (args.customGatewayMode) {
+      const result = await customGatewayGenerateText({
+        modelId: args.modelId,
+        apiKey: args.apiKey,
+        baseUrl: args.baseUrl,
+        system: args.system,
+        user: args.user,
+        maxOutputTokens: args.maxOutputTokens,
+        reasoningEffort: args.reasoningEffort,
+        conversationId: args.conversationId,
+        userAgent: args.userAgent,
+        // Only sent when explicitly enabled: the Agent Plan gateway accepts
+        // response_format and ignores it, so blindly sending a schema would
+        // silently mislead the trace log.
+        jsonSchema: args.customGatewayStructuredOutput ? args.jsonSchema : undefined,
+        signal: args.signal,
+        onDelta: args.onDelta,
+        onReasoningDelta: args.onReasoningDelta,
+        onUsage: args.onUsage,
+        onTrace: args.onTrace,
+        onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+        onProviderRequest: args.onProviderRequest,
+        onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+      });
+      return { text: result.text };
+    }
+
+    return openAiCompatibleGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      baseUrl: args.baseUrl,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      requireStructuredOutput: args.requireStructuredOutput,
+      reasoningEffort: args.reasoningEffort,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "xai") {
+    return xaiGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      reasoningEffortAttempts: args.reasoningEffortAttempts,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "meta") {
+    return metaGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      reasoningEffortAttempts: args.reasoningEffortAttempts,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  if (args.provider === "zai") {
+    return zaiGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      reasoningEffortAttempts: args.reasoningEffortAttempts,
+      temperature: DEFAULT_TEMPERATURE,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  // Qwen models are currently OpenRouter-only in MineBench
+  if (args.provider === "qwen") {
+    throw new Error("Qwen direct API not supported; use OpenRouter fallback");
+  }
+
+  if (args.provider === "minimax") {
+    return minimaxGenerateText({
+      modelId: args.modelId,
+      apiKey: args.apiKey,
+      system: args.system,
+      user: args.user,
+      maxOutputTokens: args.maxOutputTokens,
+      temperature: DEFAULT_TEMPERATURE,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onTrace: args.onTrace,
+      onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+      onProviderRequest: args.onProviderRequest,
+      onAcceptedRequestConfiguration: args.onAcceptedRequestConfiguration,
+    });
+  }
+
+  throw new Error(`Direct API not supported for provider ${args.provider}`);
+}
+
+// unified direct and OpenRouter provider routing
+async function providerGenerateText(args: {
+  model: ResolvedModel;
+  system: string;
+  user: string;
+  jsonSchema: Record<string, unknown>;
+  maxOutputTokens: number;
+  reasoningMaxTokens?: number;
+  reasoning?: string;
+  providerKeys?: ProviderApiKeys;
+  allowServerKeys: boolean;
+  preferOpenRouter?: boolean;
+  signal?: AbortSignal;
+  onDelta?: (delta: string) => void;
+  onReasoningDelta?: (delta: string) => void;
+  onUsage?: (usage: import("@/lib/ai/providers/customGateway").CustomUsage) => void;
+  onProviderTrace?: (message: string) => void;
+  onAcceptedOutputTokens?: (tokens: number) => void;
+  onProviderRoute?: (route: "direct" | "openrouter") => void;
+  onAcceptedRequestConfiguration?: (configuration: string) => void;
+  onAcceptedStructuredRequestConfiguration?: (
+    configuration: AcceptedRequestConfigurationRecord,
+  ) => void;
+  onProviderRequest?: () => void;
+}): Promise<{ text: string }> {
+  const { model } = args;
+  const forceOpenRouter = Boolean(model.forceOpenRouter);
+  const preferOpenRouter = Boolean(args.preferOpenRouter);
+  const directKey = forceOpenRouter
+    ? null
+    : effectiveApiKey({
+        provider: model.provider,
+        providerKeys: args.providerKeys,
+        allowServerKeys: args.allowServerKeys,
+      });
+  const openRouterKey = effectiveApiKey({
+    provider: "openrouter",
+    providerKeys: args.providerKeys,
+    allowServerKeys: args.allowServerKeys,
+  });
+  const hasDirect = Boolean(directKey);
+  const hasOpenRouter = Boolean(openRouterKey);
+
+  if (preferOpenRouter && !model.openRouterModelId) {
+    throw new Error(
+      `${model.displayName} is not integrated with OpenRouter in MineBench (missing openRouterModelId).`,
+    );
+  }
+  if (preferOpenRouter && !hasOpenRouter) {
+    throw new Error(
+      `OpenRouter routing requested for ${model.displayName}, but no OpenRouter API key is available.`,
+    );
+  }
+  if (model.provider === "custom" && preferOpenRouter) {
+    throw new Error("OpenRouter routing is unavailable for custom API models.");
+  }
+  if (model.provider === "custom" && !forceOpenRouter && !hasDirect) {
+    throw new Error(
+      `Missing custom API key. Provide your own ${envVarForProviderKey("custom")} key.`,
+    );
+  }
+
+  // if we have neither key and there's an openrouter model id, error out
+  if (!hasDirect && !hasOpenRouter) {
+    if (forceOpenRouter) {
+      throw new Error(
+        `Missing OpenRouter API key. Provide OPENROUTER_API_KEY to run ${model.displayName}.`,
+      );
+    }
+
+    const directEnvVar = envVarForDirectProvider(model.provider);
+
+    if (model.openRouterModelId) {
+      throw new Error(
+        `Missing API key for ${model.provider}. Provide your own ${directEnvVar ?? "provider"} key or an OpenRouter key.`,
+      );
+    }
+
+    throw new Error(`Missing API key for ${model.provider}. Provide your own ${directEnvVar ?? "provider"} key.`);
+  }
+
+  // try direct provider first if we have the key
+  if (!forceOpenRouter && !preferOpenRouter && hasDirect) {
+    const directOpenAiReasoningEffortAttempts =
+      model.provider === "openai"
+        ? openAiReasoningEffortAttempts(model.modelId, args.reasoning)
+        : undefined;
+    const directXaiReasoningEffortAttempts =
+      model.provider === "xai"
+        ? xaiReasoningEffortAttempts(model.modelId, args.reasoning)
+        : undefined;
+    const directMetaReasoningEffortAttempts =
+      model.provider === "meta"
+        ? metaReasoningEffortAttempts(model.modelId, args.reasoning)
+        : undefined;
+    const directZaiReasoningEffortAttempts =
+      model.provider === "zai"
+        ? zaiReasoningEffortAttempts(model.modelId, args.reasoning)
+        : undefined;
+    const directAnthropicAdaptiveEffortAttempts =
+      model.provider === "anthropic"
+        ? anthropicAdaptiveEffortAttempts(model.modelId, args.reasoning)
+        : undefined;
+    const directGeminiThinkingConfig =
+      model.provider === "gemini"
+        ? geminiThinkingConfigForModel(model.modelId, args.reasoning)
+        : undefined;
+    const directMoonshotThinkingConfig =
+      model.provider === "moonshot"
+        ? moonshotThinkingConfigForModel(model.modelId, args.reasoning)
+        : undefined;
+    const directDeepSeekThinkingConfig =
+      model.provider === "deepseek"
+        ? deepseekThinkingConfigForModel(model.modelId, args.reasoning)
+        : undefined;
+    if (model.provider === "xai" && !directXaiReasoningEffortAttempts) {
+      xaiAutomaticReasoningForModel(model.modelId, args.reasoning);
+    }
+    const requestConfiguration = providerRequestTraceLine({
+      route: "direct",
+      provider: model.provider,
+      modelId: model.modelId,
+      maxOutputTokens: args.maxOutputTokens,
+      reasoningMaxTokens: args.reasoningMaxTokens,
+      reasoningEffortAttempts:
+        directOpenAiReasoningEffortAttempts ??
+        directXaiReasoningEffortAttempts ??
+        directMetaReasoningEffortAttempts ??
+        directZaiReasoningEffortAttempts,
+      adaptiveEffortAttempts: directAnthropicAdaptiveEffortAttempts,
+      geminiThinkingConfig: directGeminiThinkingConfig,
+      moonshotThinkingConfig: directMoonshotThinkingConfig,
+      deepseekThinkingConfig: directDeepSeekThinkingConfig,
+    });
+    // Reuse the normalized request description as the benchmark configuration fingerprint
+    args.onProviderTrace?.(
+      `Routing via direct ${model.provider} provider (${model.modelId}). ${requestConfiguration}`,
+    );
+    args.onProviderRoute?.("direct");
+    args.signal?.throwIfAborted();
+    try {
+      return await callDirectProvider({
+        provider: model.provider,
+        modelId: model.modelId,
+        apiKey: directKey ?? undefined,
+        baseUrl: model.baseUrl,
+        requireStructuredOutput: model.requireStructuredOutput,
+        customGatewayMode: model.customGatewayMode,
+        customGatewayStructuredOutput: model.customGatewayStructuredOutput,
+        conversationId: model.conversationId,
+        userAgent: model.userAgent,
+        onReasoningDelta: args.onReasoningDelta,
+        onUsage: args.onUsage,
+        system: args.system,
+        user: args.user,
+        jsonSchema: args.jsonSchema,
+        maxOutputTokens: args.maxOutputTokens,
+        reasoningMaxTokens: args.reasoningMaxTokens,
+        reasoningEffort: model.provider === "custom" ? args.reasoning : undefined,
+        reasoningEffortAttempts:
+          directOpenAiReasoningEffortAttempts ??
+          directXaiReasoningEffortAttempts ??
+          directMetaReasoningEffortAttempts ??
+          directZaiReasoningEffortAttempts,
+        adaptiveEffortAttempts: directAnthropicAdaptiveEffortAttempts,
+        geminiThinkingConfig: directGeminiThinkingConfig,
+        moonshotThinkingConfig: directMoonshotThinkingConfig,
+        deepseekThinkingConfig: directDeepSeekThinkingConfig,
+        signal: args.signal,
+        onDelta: args.onDelta,
+        onTrace: args.onProviderTrace,
+        onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+        onProviderRequest: args.onProviderRequest,
+        onAcceptedRequestConfiguration: (configuration) => {
+          args.onAcceptedRequestConfiguration?.(
+            acceptedProviderRequestConfigurationLine(configuration),
+          );
+          args.onAcceptedStructuredRequestConfiguration?.({
+            ...configuration,
+            providerRoute: "direct",
+            resolvedModelId: model.modelId,
+          });
+        },
+      });
+    } catch (directErr) {
+      // If a direct provider key is present, do not fall back to OpenRouter.
+      throw directErr;
+    }
+  }
+
+  // use OpenRouter when selected explicitly or when no direct key is available
+  if (!model.openRouterModelId) {
+    throw new Error(`No OpenRouter model ID configured for ${model.key}`);
+  }
+
+  const normalizedReasoning = args.reasoning?.trim().toLowerCase();
+  const openRouterUsesThinkingToggle =
+    model.openRouterModelId === "moonshotai/kimi-k2.6" ||
+    model.openRouterModelId === "moonshotai/kimi-k2.5";
+  const openRouterUsesAutomaticReasoning = model.openRouterModelId === "x-ai/grok-4.3";
+  if (openRouterUsesAutomaticReasoning) {
+    xaiAutomaticReasoningForModel(model.openRouterModelId, args.reasoning);
+  }
+  const xaiOpenRouterReasoningEnabled = openRouterReasoningEnabledForModel(
+    model.openRouterModelId,
+    args.reasoning,
+  );
+  const openRouterReasoningEnabled =
+    xaiOpenRouterReasoningEnabled ??
+    (openRouterUsesThinkingToggle
+      ? !normalizedReasoning ||
+        normalizedReasoning === "enabled" ||
+        normalizedReasoning === "default" ||
+        normalizedReasoning === "on"
+      : false);
+  if (
+    openRouterUsesThinkingToggle &&
+    normalizedReasoning &&
+    !["enabled", "default", "on", "disabled", "off", "none"].includes(normalizedReasoning)
+  ) {
+    throw new Error(
+      `OpenRouter model ${model.openRouterModelId} does not support reasoning '${args.reasoning}'. Supported values: enabled, disabled.`,
+    );
+  }
+  const openRouterReasoningEffortAttempts =
+    xaiOpenRouterReasoningEnabled !== undefined ||
+    openRouterUsesThinkingToggle ||
+    openRouterUsesAutomaticReasoning
+      ? undefined
+      : openRouterReasoningEffortAttemptsForModel(
+          model.openRouterModelId,
+          args.reasoning,
+        );
+
+  const requestConfiguration = providerRequestTraceLine({
+    route: "openrouter",
+    provider: "openrouter",
+    modelId: model.openRouterModelId,
+    maxOutputTokens: args.maxOutputTokens,
+    reasoningMaxTokens: args.reasoningMaxTokens,
+    reasoningEffortAttempts: openRouterReasoningEffortAttempts,
+    openRouterReasoningEnabled,
+    reasoningRequired: modelRequiresReasoning(model.openRouterModelId),
+  });
+  // Keep OpenRouter and direct routes on the same configuration capture contract
+  args.onProviderTrace?.(
+    `Routing via OpenRouter (${model.openRouterModelId}). ${requestConfiguration}`,
+  );
+  args.onProviderRoute?.("openrouter");
+  args.signal?.throwIfAborted();
+
+  return openrouterGenerateText({
+    modelId: model.openRouterModelId,
+    apiKey: openRouterKey ?? undefined,
+    system: args.system,
+    user: args.user,
+    maxOutputTokens: args.maxOutputTokens,
+    automaticReasoning: openRouterUsesAutomaticReasoning,
+    enableReasoning: openRouterReasoningEnabled,
+    reasoningMaxTokens: args.reasoningMaxTokens,
+    temperature: DEFAULT_TEMPERATURE,
+    jsonSchema: model.requireStructuredOutput === false ? undefined : args.jsonSchema,
+    requireParameterSupport:
+      model.requireStructuredOutput ?? model.provider !== "custom",
+    reasoningEffortAttempts: openRouterReasoningEffortAttempts,
+    requireReasoning: modelRequiresReasoning(model.openRouterModelId),
+    signal: args.signal,
+    onDelta: args.onDelta,
+    onTrace: args.onProviderTrace,
+    onAcceptedOutputTokens: args.onAcceptedOutputTokens,
+    onProviderRequest: args.onProviderRequest,
+    onAcceptedRequestConfiguration: (configuration) => {
+      args.onAcceptedRequestConfiguration?.(
+        acceptedProviderRequestConfigurationLine(configuration),
+      );
+      args.onAcceptedStructuredRequestConfiguration?.({
+        ...configuration,
+        providerRoute: "openrouter",
+        resolvedModelId: model.openRouterModelId ?? model.modelId,
+      });
+    },
+  });
+}
+
+function validateParsedJson(json: unknown, palette: BlockDefinition[], gridSize: 64 | 256 | 512) {
+  return validateVoxelBuild(json, {
+    palette,
+    gridSize,
+    maxBlocks: MAX_BLOCKS_BY_GRID[gridSize],
+  });
+}
+
+function buildBounds(build: VoxelBuild) {
+  if (build.blocks.length === 0) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+
+  for (const b of build.blocks) {
+    if (b.x < minX) minX = b.x;
+    if (b.y < minY) minY = b.y;
+    if (b.z < minZ) minZ = b.z;
+    if (b.x > maxX) maxX = b.x;
+    if (b.y > maxY) maxY = b.y;
+    if (b.z > maxZ) maxZ = b.z;
+  }
+
+  const spanX = maxX - minX + 1;
+  const spanY = maxY - minY + 1;
+  const spanZ = maxZ - minZ + 1;
+  return { minX, minY, minZ, maxX, maxY, maxZ, spanX, spanY, spanZ };
+}
+
+export async function generateVoxelBuild(
+  params: GenerateVoxelBuildParams,
+): Promise<GenerateVoxelBuildResult> {
+  const model: ResolvedModel =
+    params.model ??
+    (() => {
+      if (!params.modelKey) throw new Error("Missing modelKey");
+      const catalogModel = getModelByKey(params.modelKey);
+      return {
+        key: catalogModel.key,
+        provider: catalogModel.provider,
+        modelId: catalogModel.modelId,
+        displayName: catalogModel.displayName,
+        openRouterModelId: catalogModel.openRouterModelId,
+        forceOpenRouter: catalogModel.forceOpenRouter,
+        importOnly: catalogModel.importOnly,
+      };
+    })();
+  if (model.importOnly) {
+    return {
+      ok: false,
+      error:
+        `${model.displayName} is import-only in MineBench. Add web harness JSON files such as ` +
+        `uploads/castle/castle-gpt-4-5-web-harness.json and upload/import them.`,
+      generationTimeMs: 0,
+    };
+  }
+  const paletteDefs = getPalette(params.palette);
+  const enableTools = params.enableTools ?? true;
+  const maxAttempts = params.maxAttempts ?? (enableTools ? 8 : 3);
+  const allowServerKeys = params.allowServerKeys ?? true;
+
+  const minBlocks = MIN_BLOCKS_BY_GRID[params.gridSize] ?? 80;
+  const maxOutputTokens = defaultMaxOutputTokens(
+    params.gridSize,
+    model.modelId,
+    params.maxOutputTokens,
+  );
+  const reasoningMaxTokens = defaultMaxReasoningTokens(model.modelId, maxOutputTokens);
+  const schemaMaxBlocks = approxMaxBlocksForTokenBudget({
+    maxOutputTokens,
+    minBlocks,
+    hardMax: MAX_BLOCKS_BY_GRID[params.gridSize],
+  });
+  const jsonSchema = enableTools
+    ? (voxelExecToolCallJsonSchema() as unknown as Record<string, unknown>)
+    : (makeVoxelBuildJsonSchema({
+        gridSize: params.gridSize,
+        minBlocks,
+        maxBlocks: schemaMaxBlocks,
+      }) as unknown as Record<string, unknown>);
+  const baseSystem = buildSystemPrompt({
+    gridSize: params.gridSize,
+    maxBlocks: MAX_BLOCKS_BY_GRID[params.gridSize],
+    minBlocks,
+    palette: params.palette,
+    enableTools,
+  });
+  const system = enableTools
+    ? baseSystem +
+      `\n\n## TOOL MODE (${VOXEL_EXEC_TOOL_NAME})\n\n` +
+      `You have access to a code-execution tool named "${VOXEL_EXEC_TOOL_NAME}".\n` +
+      `- You must do all planning and design yourself.\n` +
+      `- The tool only executes your JavaScript to emit voxels; it does not design anything for you.\n\n` +
+      `Inside your code you may use ONLY these runtime globals:\n` +
+      `- block(x, y, z, type)\n` +
+      `- box(x1, y1, z1, x2, y2, z2, type)\n` +
+      `- line(x1, y1, z1, x2, y2, z2, type)\n` +
+      `- rng() (seeded if you pass seed)\n` +
+      `- Math\n\n` +
+      `Return ONLY this JSON tool call object (no markdown, no extra keys):\n` +
+      `{"tool":"${VOXEL_EXEC_TOOL_NAME}","input":{"code":"...","gridSize":${params.gridSize},"palette":"${params.palette}","seed":123}}\n\n` +
+      `NEVER output the voxel build JSON directly; generate it via the tool.\n`
+    : baseSystem;
+
+  params.onProviderTrace?.(
+    `Generation config: grid_size=${params.gridSize}, palette=${params.palette}, tool_mode=${enableTools ? VOXEL_EXEC_TOOL_NAME : "disabled"}, min_blocks=${minBlocks}, max_blocks=${MAX_BLOCKS_BY_GRID[params.gridSize]}, schema_max_blocks=${schemaMaxBlocks}, max_output_tokens=${maxOutputTokens}, reasoning_max_tokens=${formatOptionalInteger(reasoningMaxTokens)}.`,
+  );
+
+  let previousText = "";
+  let lastError = "";
+  let acceptedOutputTokens: number | undefined;
+  let providerRoute: "direct" | "openrouter" | undefined;
+  let requestConfiguration: string | undefined;
+  let acceptedRequestConfiguration: AcceptedRequestConfigurationRecord | undefined;
+  let callbackDurationMs = 0;
+  const start = performance.now();
+  const invokeCallback = <Args extends unknown[]>(
+    callback: ((...args: Args) => void) | undefined,
+    ...args: Args
+  ): void => {
+    if (!callback) return;
+    const callbackStartedAt = performance.now();
+    try {
+      callback(...args);
+    } finally {
+      // Caller persistence and logging are not model inference work
+      callbackDurationMs += performance.now() - callbackStartedAt;
+    }
+  };
+  const measuredInferenceTimeMs = (): number =>
+    Math.max(0, Math.round(performance.now() - start - callbackDurationMs));
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const user =
+      attempt === 1
+        ? buildUserPrompt(params.prompt)
+        : buildRepairPrompt({
+            error: lastError || "Invalid JSON",
+            previousOutput: previousText.slice(0, 20000),
+            originalPrompt: params.prompt,
+          }) +
+          (enableTools
+            ? `\n\nReminder: return ONLY the ${VOXEL_EXEC_TOOL_NAME} tool call JSON (not the build JSON).`
+            : "");
+
+    if (attempt > 1 && params.onRetry) {
+      const callbackStartedAt = performance.now();
+      try {
+        await params.onRetry(attempt, lastError);
+      } finally {
+        callbackDurationMs += performance.now() - callbackStartedAt;
+      }
+    }
+
+    let providerRequestStarted = false;
+    try {
+      const { text } = await providerGenerateText({
+        model,
+        system,
+        user,
+        jsonSchema,
+        maxOutputTokens,
+        reasoningMaxTokens,
+        reasoning: params.reasoning,
+        providerKeys: params.providerKeys,
+        allowServerKeys,
+        preferOpenRouter: params.preferOpenRouter,
+        signal: params.abortSignal,
+        onDelta: params.onDelta
+          ? (delta) => invokeCallback(params.onDelta, delta)
+          : undefined,
+        onReasoningDelta: params.onReasoningDelta
+          ? (delta) => invokeCallback(params.onReasoningDelta, delta)
+          : undefined,
+        onUsage: params.onUsage
+          ? (usage) => invokeCallback(params.onUsage, usage)
+          : undefined,
+        onProviderTrace: params.onProviderTrace
+          ? (message) => invokeCallback(params.onProviderTrace, message)
+          : undefined,
+        onAcceptedOutputTokens: (tokens) => {
+          acceptedOutputTokens = tokens;
+        },
+        onProviderRoute: (route) => {
+          providerRoute = route;
+        },
+        onAcceptedRequestConfiguration: (configuration) => {
+          requestConfiguration = configuration;
+        },
+        onAcceptedStructuredRequestConfiguration: (configuration) => {
+          acceptedRequestConfiguration = configuration;
+        },
+        onProviderRequest: () => {
+          invokeCallback(params.onProviderRequest, attempt);
+          providerRequestStarted = true;
+        },
+      });
+      previousText = text;
+      try {
+        invokeCallback(params.onRawResponse, attempt, text);
+      } catch (err) {
+        const message = getErrorMessage(err, String(err));
+        invokeCallback(
+          params.onProviderTrace,
+          `Raw response callback failed for attempt ${attempt}: ${message}`,
+        );
+      }
+      let releaseBuildProcessing: (() => void) | undefined;
+      if (params.acquireBuildProcessing) {
+        const acquireStartedAt = performance.now();
+        try {
+          releaseBuildProcessing = await params.acquireBuildProcessing();
+        } finally {
+          // Queueing behind another build is worker backpressure, not inference time
+          callbackDurationMs += performance.now() - acquireStartedAt;
+        }
+      }
+
+      let keepBuildProcessingLease = false;
+      try {
+        params.abortSignal?.throwIfAborted();
+        const json = enableTools ? extractFirstJsonObject(text) : extractBestVoxelBuildJson(text);
+        if (!json) {
+          lastError = "Could not find a valid JSON object in the response";
+          continue;
+        }
+
+        const buildJson: unknown = enableTools
+          ? (() => {
+              const parsedCall = voxelExecToolCallSchema.safeParse(json);
+              if (!parsedCall.success) {
+                lastError = parsedCall.error.message;
+                return null;
+              }
+
+              const call = parsedCall.data;
+              if (call.input.gridSize !== params.gridSize) {
+                lastError = `Tool call gridSize mismatch (${call.input.gridSize} vs ${params.gridSize})`;
+                return null;
+              }
+              if (call.input.palette !== params.palette) {
+                lastError = `Tool call palette mismatch (${call.input.palette} vs ${params.palette})`;
+                return null;
+              }
+
+              const run = runVoxelExec({
+                code: call.input.code,
+                gridSize: params.gridSize,
+                palette: params.palette,
+                seed: call.input.seed,
+              });
+
+              return run.build;
+            })()
+          : json;
+
+        if (!buildJson) continue;
+
+        const validated = enableTools
+          ? validateVoxelBuildSpec(buildJson as VoxelBuild, {
+              palette: paletteDefs,
+              gridSize: params.gridSize,
+              maxBlocks: MAX_BLOCKS_BY_GRID[params.gridSize],
+            })
+          : validateParsedJson(buildJson, paletteDefs, params.gridSize);
+        if (!validated.ok) {
+          lastError = validated.error;
+          continue;
+        }
+
+        const expandedBuild = validated.value.build;
+        const blockCount = expandedBuild.blocks.length;
+
+        if (blockCount === 0) {
+          lastError =
+            "No valid blocks after validation. Use ONLY in-bounds coordinates and ONLY block IDs from the available list.";
+          continue;
+        }
+
+        if (blockCount < minBlocks) {
+          lastError = `Build too small (${blockCount} blocks). Create at least ~${minBlocks} blocks so the result is recognizable.`;
+          continue;
+        }
+
+        const bounds = buildBounds(expandedBuild);
+        if (bounds) {
+          const minFootprint = Math.max(6, Math.floor(params.gridSize * 0.15));
+          const minHeight = Math.max(4, Math.floor(params.gridSize * 0.1));
+          const maxFootprintSpan = Math.max(bounds.spanX, bounds.spanZ);
+
+          if (maxFootprintSpan < minFootprint) {
+            lastError = `Build footprint too small (span ${maxFootprintSpan}). Expand the build to span at least ~${minFootprint} blocks across x or z for more detail.`;
+            continue;
+          }
+
+          if (bounds.spanY < minHeight) {
+            lastError = `Build height too small (span ${bounds.spanY}). Add more vertical structure (span at least ~${minHeight}) so it reads clearly.`;
+            continue;
+          }
+        }
+
+        let build = expandedBuild;
+        if (!params.returnExpandedBuild) {
+          const spec = parseVoxelBuildSpec(buildJson);
+          if (!spec.ok) {
+            lastError = spec.error;
+            continue;
+          }
+          build = spec.value;
+        }
+
+        const generationTimeMs = measuredInferenceTimeMs();
+        keepBuildProcessingLease = true;
+        return {
+          ok: true,
+          build,
+          warnings: validated.value.warnings,
+          blockCount,
+          generationTimeMs,
+          acceptedOutputTokens,
+          providerRoute,
+          requestConfiguration,
+          acceptedRequestConfiguration,
+          rawText: text,
+        };
+      } finally {
+        if (!keepBuildProcessingLease) releaseBuildProcessing?.();
+      }
+    } catch (err) {
+      lastError = getErrorMessage(err, "Provider request failed");
+      if (params.abortSignal?.aborted) break;
+      // Retry transient work that failed safely before an outbound request
+      if (
+        !providerRequestStarted &&
+        isDeterministicProviderPreflightError(lastError)
+      ) {
+        break;
+      }
+      // Avoid expensive duplicate retries when the upstream likely processed work
+      // but the client timed out waiting for headers/body.
+      if (isBilledTimeoutStyleProviderError(lastError)) break;
+      if (isExhaustedOutputBudgetProviderError(lastError)) break;
+      if (isDeterministicStructuredSchemaProviderError(lastError)) break;
+    }
+  }
+
+  return {
+    ok: false,
+    error: lastError || "Generation failed",
+    rawText: previousText,
+    generationTimeMs: measuredInferenceTimeMs(),
+    acceptedOutputTokens,
+    providerRoute,
+    requestConfiguration,
+    acceptedRequestConfiguration,
+  };
+}
+
+export function maxBlocksForGrid(gridSize: 64 | 256 | 512) {
+  return MAX_BLOCKS_BY_GRID[gridSize];
+}

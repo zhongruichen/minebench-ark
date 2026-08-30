@@ -1,0 +1,340 @@
+import { z } from "zod";
+import { NextResponse } from "next/server";
+import { waitUntil } from "@vercel/functions";
+import { generateVoxelBuild } from "@/lib/ai/generateVoxelBuild";
+import { getModelByKey, ModelKey } from "@/lib/ai/modelCatalog";
+import { assertSafeCustomApiUrl } from "@/lib/ai/providers/customApiGuard";
+import type { GenerateEvent, GenerateModelRequest, GenerateRequest } from "@/lib/ai/types";
+import { publishGenerationError, publishGenerationSuccess } from "@/lib/observability/cloudwatch";
+
+export const runtime = "nodejs";
+
+const providerKeysSchema = z
+  .object({
+    openai: z.string().trim().min(1).max(4000).optional(),
+    anthropic: z.string().trim().min(1).max(4000).optional(),
+    gemini: z.string().trim().min(1).max(4000).optional(),
+    moonshot: z.string().trim().min(1).max(4000).optional(),
+    deepseek: z.string().trim().min(1).max(4000).optional(),
+    minimax: z.string().trim().min(1).max(4000).optional(),
+    xai: z.string().trim().min(1).max(4000).optional(),
+    meta: z.string().trim().min(1).max(4000).optional(),
+    zai: z.string().trim().min(1).max(4000).optional(),
+    openrouter: z.string().trim().min(1).max(4000).optional(),
+    custom: z.string().trim().min(1).max(4000).optional(),
+  })
+  .optional();
+
+const modelRequestSchema = z.union([
+  z.object({
+    id: z.string().trim().min(1).max(200),
+    kind: z.literal("catalog"),
+    modelKey: z.string().trim().min(1).max(200),
+  }),
+  z.object({
+    id: z.string().trim().min(1).max(200),
+    kind: z.literal("custom"),
+    provider: z.literal("custom"),
+    displayName: z.string().trim().min(1).max(120),
+    modelId: z.string().trim().min(1).max(240),
+    baseUrl: z.string().trim().url().max(4000),
+    customGatewayMode: z.boolean().optional(),
+    customGatewayStructuredOutput: z.boolean().optional(),
+    reasoningEffort: z
+      .enum(["low", "medium", "high", "xhigh", "max", "none"])
+      .optional(),
+    conversationId: z.string().trim().min(1).max(200).optional(),
+    userAgent: z.string().trim().min(1).max(200).optional(),
+  }),
+  z.object({
+    id: z.string().trim().min(1).max(200),
+    kind: z.literal("custom"),
+    provider: z.literal("openrouter"),
+    displayName: z.string().trim().min(1).max(120),
+    modelId: z.string().trim().min(1).max(240),
+  }),
+]);
+
+const reqSchema = z.object({
+  prompt: z.string().min(1).max(800),
+  gridSize: z.union([z.literal(64), z.literal(256), z.literal(512)]),
+  palette: z.union([z.literal("simple"), z.literal("advanced")]),
+  modelKeys: z.array(z.string()).min(1).max(8).optional(),
+  models: z.array(modelRequestSchema).min(1).max(8).optional(),
+  providerKeys: providerKeysSchema,
+}).superRefine((value, ctx) => {
+  if ((!value.models || value.models.length === 0) && (!value.modelKeys || value.modelKeys.length === 0)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Provide at least one model.",
+      path: ["models"],
+    });
+  }
+});
+
+const STREAM_PAD = " ".repeat(2048);
+const PING_INTERVAL_MS = 15_000;
+
+function isModelKey(v: string): v is ModelKey {
+  try {
+    getModelByKey(v as ModelKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function POST(req: Request) {
+  const json = (await req.json().catch(() => null)) as unknown;
+  const parsed = reqSchema.safeParse(json);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: parsed.error.message },
+      { status: 400 }
+    );
+  }
+
+  const body = parsed.data as GenerateRequest;
+  const requestedModels: GenerateModelRequest[] =
+    body.models && body.models.length > 0
+      ? body.models
+      : (body.modelKeys ?? []).map((modelKey) => ({
+          id: modelKey,
+          kind: "catalog" as const,
+          modelKey,
+        }));
+  const seenModelIds = new Set<string>();
+  for (const model of requestedModels) {
+    if (seenModelIds.has(model.id)) {
+      return NextResponse.json({ error: "Model ids must be unique" }, { status: 400 });
+    }
+    seenModelIds.add(model.id);
+  }
+  const models = requestedModels.flatMap((model): GenerateModelRequest[] => {
+    if (model.kind !== "catalog") return [model];
+    return isModelKey(model.modelKey) ? [model] : [];
+  });
+  if (models.length === 0) {
+    return NextResponse.json({ error: "No valid modelKeys" }, { status: 400 });
+  }
+
+  for (const model of models) {
+    if (model.kind !== "custom" || model.provider !== "custom") continue;
+    try {
+      // Gateway mode keeps the operator path verbatim (e.g. /api/plan/v3),
+      // so the guard must validate that exact URL shape.
+      await assertSafeCustomApiUrl(model.baseUrl, {
+        exactPath: Boolean(model.customGatewayMode),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Invalid custom API server URL";
+      return NextResponse.json({ error: message }, { status: 400 });
+    }
+  }
+
+  const providerKeys = body.providerKeys;
+  const allowServerKeys =
+    process.env.NODE_ENV !== "production" || process.env.MINEBENCH_ALLOW_SERVER_KEYS === "1";
+  if (!allowServerKeys && (!providerKeys || Object.values(providerKeys).every((v) => !v))) {
+    return NextResponse.json(
+      {
+        error: "Add an OpenRouter or provider API key in Generate settings.",
+      },
+      { status: 400 }
+    );
+  }
+
+  const debugRaw = process.env.AI_DEBUG === "1";
+  const RAW_TEXT_MAX = 200_000;
+
+  const encoder = new TextEncoder();
+  let closed = false;
+  let ping: ReturnType<typeof setInterval> | null = null;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      req.signal.addEventListener(
+        "abort",
+        () => {
+          closed = true;
+          if (ping) clearInterval(ping);
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+        },
+        { once: true }
+      );
+
+      const send = (evt: GenerateEvent) => {
+        if (closed) return;
+        if (debugRaw && evt.type === "error" && evt.rawText) {
+          console.log(`[ai debug] ${evt.modelKey} error: ${evt.message}`);
+          console.log(`[ai debug] ${evt.modelKey} rawText:\n${evt.rawText}`);
+        }
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(evt) + "\n"));
+        } catch {
+          // client disconnected / stream already closed
+          closed = true;
+          if (ping) clearInterval(ping);
+        }
+      };
+
+      ping = setInterval(() => {
+        send({ type: "ping", ts: Date.now() });
+      }, PING_INTERVAL_MS);
+
+      const safeClose = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          if (ping) clearInterval(ping);
+          controller.close();
+        } catch {
+          // already closed
+        }
+      };
+
+      // A larger first chunk helps avoid proxy buffering so the client receives events immediately.
+      send({ type: "hello", ts: Date.now(), pad: STREAM_PAD });
+
+      let pending = models.length;
+      for (const model of models) {
+        const requestModelKey = model.id;
+        send({ type: "start", modelKey: requestModelKey });
+
+        void generateVoxelBuild(
+          model.kind === "catalog"
+            ? {
+                modelKey: model.modelKey,
+                prompt: body.prompt,
+                gridSize: body.gridSize,
+                palette: body.palette,
+                maxAttempts: 2,
+                providerKeys,
+                allowServerKeys,
+                abortSignal: req.signal,
+                onRetry: (attempt, reason) =>
+                  send({ type: "retry", modelKey: requestModelKey, attempt, reason }),
+                onDelta: (delta) => send({ type: "delta", modelKey: requestModelKey, delta }),
+              }
+            : {
+                model:
+                  model.provider === "openrouter"
+                    ? {
+                        key: model.id,
+                        provider: "custom",
+                        modelId: model.modelId,
+                        displayName: model.displayName,
+                        openRouterModelId: model.modelId,
+                        forceOpenRouter: true,
+                      }
+                    : {
+                        key: model.id,
+                        provider: "custom",
+                        modelId: model.modelId,
+                        displayName: model.displayName,
+                        baseUrl: model.baseUrl,
+                        customGatewayMode: model.customGatewayMode,
+                        customGatewayStructuredOutput: model.customGatewayStructuredOutput,
+                        conversationId: model.conversationId,
+                        userAgent: model.userAgent,
+                      },
+                prompt: body.prompt,
+                gridSize: body.gridSize,
+                palette: body.palette,
+                maxAttempts: 2,
+                providerKeys,
+                allowServerKeys,
+                reasoning:
+                  model.provider === "custom" ? model.reasoningEffort : undefined,
+                abortSignal: req.signal,
+                onRetry: (attempt, reason) =>
+                  send({ type: "retry", modelKey: requestModelKey, attempt, reason }),
+                onDelta: (delta) => send({ type: "delta", modelKey: requestModelKey, delta }),
+                onReasoningDelta: (delta) =>
+                  send({ type: "reasoning", modelKey: requestModelKey, delta }),
+                onProviderTrace: (message) =>
+                  send({ type: "trace", modelKey: requestModelKey, message }),
+                onUsage: (usage) =>
+                  send({
+                    type: "usage",
+                    modelKey: requestModelKey,
+                    usage: {
+                      promptTokens: usage.prompt_tokens,
+                      completionTokens: usage.completion_tokens,
+                      totalTokens: usage.total_tokens,
+                      reasoningTokens: usage.completion_tokens_details?.reasoning_tokens,
+                      cachedTokens: usage.prompt_tokens_details?.cached_tokens,
+                    },
+                  }),
+              },
+        )
+          .then((r) => {
+            if (r.ok) {
+              waitUntil(publishGenerationSuccess({
+                jobType: "stream",
+                model: requestModelKey,
+                durationMs: r.generationTimeMs ?? 0,
+              }));
+              send({
+                type: "result",
+                modelKey: requestModelKey,
+                voxelBuild: r.build,
+                metrics: {
+                  blockCount: r.blockCount,
+                  warnings: r.warnings,
+                  generationTimeMs: r.generationTimeMs,
+                  jsonBytes: Buffer.byteLength(r.rawText),
+                },
+              });
+            } else {
+              waitUntil(publishGenerationError({
+                jobType: "stream",
+                model: requestModelKey,
+                errorType: r.error || "generation_error",
+              }));
+              send({
+                type: "error",
+                modelKey: requestModelKey,
+                message: r.error,
+                rawText: r.rawText ? r.rawText.slice(0, RAW_TEXT_MAX) : undefined,
+              });
+            }
+          })
+          .catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : "Generation failed";
+            waitUntil(publishGenerationError({
+              jobType: "stream",
+              model: requestModelKey,
+              errorType: message,
+            }));
+            send({
+              type: "error",
+              modelKey: requestModelKey,
+              message,
+            });
+          })
+          .finally(() => {
+            pending -= 1;
+            if (pending === 0) safeClose();
+          });
+      }
+    },
+    cancel() {
+      closed = true;
+      if (ping) clearInterval(ping);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}

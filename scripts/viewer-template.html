@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>__TITLE__ — MineBench</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#0b0e14;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+  #cv{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+  #cv:active{cursor:grabbing}
+  .panel{position:fixed;background:rgba(18,22,32,.82);backdrop-filter:blur(12px);
+    border:1px solid rgba(255,255,255,.09);border-radius:12px;color:#e6e9ef}
+  /* Leave room for the button column on the right at every width. */
+  #info{top:14px;left:14px;padding:12px 14px;max-width:min(52vw,400px)}
+  #info h1{font-size:14px;font-weight:600;line-height:1.35;margin-bottom:7px;color:#fff;
+    word-break:break-word}
+  #info .meta{font-size:11px;line-height:1.7;color:#98a2b8;font-variant-numeric:tabular-nums}
+  #info .meta b{color:#cbd3e1;font-weight:600}
+  #hint{bottom:14px;left:14px;padding:9px 13px;font-size:11px;line-height:1.65;color:#98a2b8}
+  #hint kbd{display:inline-block;padding:1px 5px;margin:0 1px;border-radius:4px;
+    background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.12);
+    font-family:ui-monospace,monospace;font-size:10px;color:#cbd3e1}
+  #ctrl{top:14px;right:14px;padding:9px;display:flex;flex-direction:column;gap:7px}
+  #ctrl button.mode{background:rgba(52,211,153,.18);border-color:rgba(52,211,153,.45);color:#d1fae5}
+  /* Touch-only flight pad: desktop uses WASD, so it stays hidden there and is
+     enabled by the >900px media query below. */
+  #fly{position:fixed;left:14px;bottom:calc(14px + env(safe-area-inset-bottom,0px));
+    padding:9px;display:none;grid-template-columns:repeat(2,1fr);gap:6px}
+  #fly button{appearance:none;border:1px solid rgba(255,255,255,.13);border-radius:8px;
+    background:rgba(255,255,255,.05);color:#dbe1ec;font-size:11px;padding:9px 12px;
+    cursor:pointer;white-space:nowrap;-webkit-user-select:none;user-select:none;
+    touch-action:none}
+  #fly button:active{background:rgba(96,165,250,.28);border-color:rgba(96,165,250,.55)}
+  #ctrl button{appearance:none;border:1px solid rgba(255,255,255,.13);border-radius:8px;
+    background:rgba(255,255,255,.05);color:#dbe1ec;font-size:11px;padding:7px 11px;
+    cursor:pointer;white-space:nowrap;transition:background .13s,border-color .13s}
+  #ctrl button:hover{background:rgba(255,255,255,.11);border-color:rgba(255,255,255,.22)}
+  #ctrl button.on{background:rgba(96,165,250,.22);border-color:rgba(96,165,250,.5);color:#dbeafe}
+  #legend{position:fixed;bottom:14px;right:14px;padding:10px 12px;max-height:44vh;
+    overflow-y:auto;font-size:10.5px;line-height:1.55;max-width:190px}
+  #legend .row{display:flex;align-items:center;gap:7px;margin:2.5px 0;color:#b6bfd0}
+  #legend .sw{width:11px;height:11px;border-radius:3px;flex:0 0 auto;
+    border:1px solid rgba(0,0,0,.4);box-shadow:inset 0 1px 1px rgba(255,255,255,.18)}
+  #legend .n{margin-left:auto;color:#7c869a;font-variant-numeric:tabular-nums}
+  #load{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:#0b0e14;color:#98a2b8;font-size:13px;z-index:99;transition:opacity .4s}
+  @media (max-width:900px){
+    #legend{display:none}
+    /* Buttons move to a horizontal strip under the title, so the heading gets
+       the full width instead of being clipped by the button column. */
+    /* Keep clear of the home indicator and any host-app floating button. */
+    #ctrl{top:auto;bottom:calc(56px + env(safe-area-inset-bottom,0px));
+      right:14px;left:14px;flex-direction:row;
+      flex-wrap:wrap;justify-content:flex-start;gap:6px;padding-right:64px}
+    /* Sit clear of the (two-row) control strip above the safe area. */
+    #fly.on{display:grid;right:14px;left:auto;
+      bottom:calc(160px + env(safe-area-inset-bottom,0px))}
+    #ctrl button{padding:9px 11px;font-size:11px}
+    #info{max-width:calc(100vw - 28px)}
+    #info h1{font-size:13px}
+    #hint{font-size:10px;padding:7px 10px;right:14px}
+  }
+  @media (max-width:420px){
+    #ctrl button{padding:8px 9px;font-size:10.5px}
+    #hint{display:none}
+  }
+</style>
+</head>
+<body>
+<div id="load">正在构建模型…</div>
+<canvas id="cv"></canvas>
+
+<div id="info" class="panel">
+  <h1 id="ttl"></h1>
+  <div class="meta" id="mt"></div>
+</div>
+
+<div id="ctrl" class="panel">
+  <button id="bMode">🕊 自由视角</button>
+  <button id="bRot" class="on">⏸ 暂停旋转</button>
+  <button id="bTop">俯视角</button>
+  <button id="bIso">等轴视角</button>
+  <button id="bFit">重置视图</button>
+  <button id="bShot">保存截图</button>
+</div>
+
+<div id="hint" class="panel"><span id="hintTxt">
+  拖动 = 旋转 &nbsp;·&nbsp; 滚轮/双指 = 缩放 &nbsp;·&nbsp; <kbd>V</kbd> 自由视角 &nbsp;·&nbsp; <kbd>F</kbd> 重置
+</span></div>
+
+<div id="fly" class="panel">
+  <button data-mv="fwd">▲ 前进</button>
+  <button data-mv="back">▼ 后退</button>
+  <button data-mv="up">⤒ 上升</button>
+  <button data-mv="down">⤓ 下降</button>
+</div>
+
+<div id="legend" class="panel"></div>
+
+<script>
+"use strict";
+// ---- embedded payload -----------------------------------------------------
+var B64 = "__BLOCK_DATA__";
+var PALETTE = __PALETTE__;   // [[name,r,g,b], ...]
+var META = __META__;
+
+// ---- decode ---------------------------------------------------------------
+function b64ToBytes(b64){
+  var bin = atob(b64), n = bin.length, out = new Uint8Array(n);
+  for (var i=0;i<n;i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+var bytes = b64ToBytes(B64);
+var WIDE = META.wide;
+var STRIDE = WIDE ? 7 : 4;
+var COUNT = (bytes.length / STRIDE) | 0;
+
+var xs = new Uint16Array(COUNT), ys = new Uint16Array(COUNT), zs = new Uint16Array(COUNT);
+var ts = new Uint8Array(COUNT);
+(function(){
+  var dv = new DataView(bytes.buffer);
+  for (var i=0,o=0;i<COUNT;i++,o+=STRIDE){
+    if (WIDE){
+      xs[i]=dv.getUint16(o,true); ys[i]=dv.getUint16(o+2,true); zs[i]=dv.getUint16(o+4,true);
+      ts[i]=bytes[o+6];
+    } else {
+      xs[i]=bytes[o]; ys[i]=bytes[o+1]; zs[i]=bytes[o+2]; ts[i]=bytes[o+3];
+    }
+  }
+})();
+
+// ---- occupancy set for face culling --------------------------------------
+var mnx=1e9,mny=1e9,mnz=1e9,mxx=-1e9,mxy=-1e9,mxz=-1e9;
+for (var i=0;i<COUNT;i++){
+  if(xs[i]<mnx)mnx=xs[i]; if(ys[i]<mny)mny=ys[i]; if(zs[i]<mnz)mnz=zs[i];
+  if(xs[i]>mxx)mxx=xs[i]; if(ys[i]>mxy)mxy=ys[i]; if(zs[i]>mxz)mxz=zs[i];
+}
+var DX=mxx-mnx+1, DY=mxy-mny+1, DZ=mxz-mnz+1;
+var occ = new Uint8Array(DX*DY*DZ);
+function idx(x,y,z){ return (y*DZ + z)*DX + x; }
+for (var i=0;i<COUNT;i++) occ[idx(xs[i]-mnx, ys[i]-mny, zs[i]-mnz)] = 1;
+function solid(x,y,z){
+  if(x<0||y<0||z<0||x>=DX||y>=DY||z>=DZ) return 0;
+  return occ[idx(x,y,z)];
+}
+
+// ---- build interleaved mesh (only exposed faces) -------------------------
+// 6 faces, each 2 triangles. Per-vertex: pos(3) normalShade(1) rgb(3)
+var FACES = [
+  {n:[ 1,0,0], v:[[1,0,0],[1,1,0],[1,1,1],[1,0,1]], s:0.76},
+  {n:[-1,0,0], v:[[0,0,1],[0,1,1],[0,1,0],[0,0,0]], s:0.62},
+  {n:[0, 1,0], v:[[0,1,0],[0,1,1],[1,1,1],[1,1,0]], s:1.00},
+  {n:[0,-1,0], v:[[0,0,1],[0,0,0],[1,0,0],[1,0,1]], s:0.42},
+  {n:[0,0, 1], v:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]], s:0.88},
+  {n:[0,0,-1], v:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]], s:0.54},
+];
+
+var verts = [];   // Float32 pos + shade
+var cols  = [];   // Uint8 rgb
+var faceCount = 0;
+// Visual centroid: accumulated over EXPOSED faces, so it tracks the visible
+// surface instead of interior volume. Used to place the orbit target.
+var cenX = 0, cenY = 0, cenZ = 0, cenW = 0;
+(function(){
+  for (var i=0;i<COUNT;i++){
+    var lx=xs[i]-mnx, ly=ys[i]-mny, lz=zs[i]-mnz;
+    var p = PALETTE[ts[i]];
+    var cr=p[1], cg=p[2], cb=p[3];          // top colour
+    var sr=p[4]!==undefined?p[4]:p[1];      // side colour
+    var sg=p[5]!==undefined?p[5]:p[2];
+    var sb=p[6]!==undefined?p[6]:p[3];
+    for (var f=0;f<6;f++){
+      var F = FACES[f];
+      if (solid(lx+F.n[0], ly+F.n[1], lz+F.n[2])) continue;
+      var q = F.v, sh = F.s;
+      // two triangles: 0,1,2  0,2,3
+      // Vertical faces use the side texture colour (grass/log read correctly)
+      var useTop = (f === 2);
+      var rr = useTop ? cr : sr, gg2 = useTop ? cg : sg, bb = useTop ? cb : sb;
+      var order = [0,1,2, 0,2,3];
+      for (var k=0;k<6;k++){
+        var vv = q[order[k]];
+        verts.push(lx+vv[0], ly+vv[1], lz+vv[2], sh);
+        cols.push(rr, gg2, bb);
+      }
+      cenX += lx; cenY += ly; cenZ += lz; cenW++;
+      faceCount++;
+    }
+  }
+  if (cenW > 0){ cenX /= cenW; cenY /= cenW; cenZ /= cenW; }
+})();
+var VERT_N = verts.length / 4;
+// Single interleaved buffer: this WebKit build does not reliably honour
+// attributes sourced from two separate ARRAY_BUFFERs, so everything lives in
+// one buffer. Layout per vertex (20 bytes):
+//   0  : pos.x   f32
+//   4  : pos.y   f32
+//   8  : pos.z   f32
+//   12 : shade   f32
+//   16 : r,g,b,a u8 x4
+var STRIDE_B = 20;
+var interleaved = new ArrayBuffer(VERT_N * STRIDE_B);
+(function(){
+  var f32 = new Float32Array(interleaved);
+  var u8  = new Uint8Array(interleaved);
+  for (var i = 0; i < VERT_N; i++) {
+    var fo = i * 5;           // 20 bytes = 5 floats
+    var bo = i * STRIDE_B;
+    f32[fo]     = verts[i*4];
+    f32[fo + 1] = verts[i*4 + 1];
+    f32[fo + 2] = verts[i*4 + 2];
+    f32[fo + 3] = verts[i*4 + 3];
+    u8[bo + 16] = cols[i*3];
+    u8[bo + 17] = cols[i*3 + 1];
+    u8[bo + 18] = cols[i*3 + 2];
+    u8[bo + 19] = 255;
+  }
+})();
+verts = null; cols = null;
+
+// ---- WebGL ---------------------------------------------------------------
+var cv = document.getElementById("cv");
+var gl = cv.getContext("webgl", {antialias:true, alpha:false, preserveDrawingBuffer:true})
+      || cv.getContext("experimental-webgl", {antialias:true, alpha:false, preserveDrawingBuffer:true});
+// NOTE: init() is deliberately NOT called here. Function declarations hoist but
+// `var` initialisers do not, so calling it mid-file would run fit() before the
+// camera state below is assigned, and those assignments would then clobber the
+// fitted values. Bootstrap happens at the very end of this script instead.
+if (!gl){
+  document.getElementById("load").textContent = "此浏览器不支持 WebGL";
+}
+
+function sh(type, src){
+  var s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+var prog, aPos, aShade, aCol, uMVP, uEye, uSpan;
+var bufAll;
+
+// ---- camera ---------------------------------------------------------------
+// Two modes:
+//   "orbit" — swing around a target point. Best for inspecting a whole build.
+//             The target itself is pannable, so it is not welded to the centre.
+//   "free"  — fly anywhere: drag looks around, WASD / on-screen pad moves.
+// All of these are assigned by fit() during bootstrap; declaring them without
+// initialisers keeps the hoisting hazard described above impossible to hit.
+var camMode = "orbit";
+var tgt;                  // orbit target
+var rotY, rotX, dist;     // orbit angles + radius
+var eye;                  // authoritative camera position in free mode
+var freeYaw, freePitch;
+var autoRot = true;
+var keys = {};
+var lastT = 0;
+
+function init(){
+  var vs = sh(gl.VERTEX_SHADER, [
+    "attribute vec3 aPos;",
+    "attribute float aShade;",
+    "attribute vec4 aCol;",
+    "uniform mat4 uMVP;",
+    "uniform vec3 uEye;",
+    "uniform float uSpan;",
+    "varying vec3 vCol;",
+    "varying float vFog;",
+    "void main(){",
+    "  gl_Position = uMVP * vec4(aPos,1.0);",
+    "  vCol = aCol.rgb * aShade;",
+    // Fog from true world distance, normalised by model span, so it never
+    // saturates the whole model (NDC z would sit at ~0.99 for every vertex).
+    "  float d = length(aPos - uEye) / max(uSpan, 1.0);",
+    "  vFog = clamp((d - 1.15) * 0.55, 0.0, 0.42);",
+    "}"
+  ].join("\n"));
+  var fs = sh(gl.FRAGMENT_SHADER, [
+    "precision mediump float;",
+    "varying vec3 vCol;",
+    "varying float vFog;",
+    "void main(){",
+    "  vec3 fog = vec3(0.043,0.055,0.078);",
+    "  gl_FragColor = vec4(mix(vCol, fog, vFog), 1.0);",
+    "}"
+  ].join("\n"));
+  prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  aPos   = gl.getAttribLocation(prog, "aPos");
+  aShade = gl.getAttribLocation(prog, "aShade");
+  aCol   = gl.getAttribLocation(prog, "aCol");
+  uMVP   = gl.getUniformLocation(prog, "uMVP");
+  uEye   = gl.getUniformLocation(prog, "uEye");
+  uSpan  = gl.getUniformLocation(prog, "uSpan");
+
+  bufAll = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufAll);
+  gl.bufferData(gl.ARRAY_BUFFER, interleaved, gl.STATIC_DRAW);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+  gl.cullFace(gl.BACK);
+  gl.clearColor(0.043, 0.055, 0.078, 1);
+
+  fit();
+  resize();
+  window.addEventListener("resize", resize);
+  bindInput();
+  fillUI();
+  syncModeBtn();
+  document.getElementById("load").style.opacity = "0";
+  setTimeout(function(){ var l=document.getElementById("load"); if(l) l.remove(); }, 420);
+  requestAnimationFrame(loop);
+}
+
+// Orbit target. The bounding-box centre is wrong for bottom-heavy builds: a
+// wide terrain base with a tall thin spire puts the box centre high in empty
+// air, so the camera appears to orbit nothing. Bias toward the visible-surface
+// centroid on Y (where the skew lives) while keeping X/Z near the box centre so
+// the build stays framed.
+function orbitTarget(){
+  var cx = DX/2, cz = DZ/2;
+  var x = cenW ? (cx * 0.35 + cenX * 0.65) : cx;
+  var z = cenW ? (cz * 0.35 + cenZ * 0.65) : cz;
+  var y;
+  if (cenW){
+    // Mostly the surface centroid, nudged up so tall features stay in frame.
+    y = cenY * 0.72 + DY * 0.5 * 0.28;
+    // Never drop below the base, nor rise past the upper mid-section.
+    y = Math.max(DY * 0.06, Math.min(y, DY * 0.62));
+  } else {
+    y = DY / 2;
+  }
+  return [x, y, z];
+}
+
+function fit(){
+  var span = Math.max(DX, DY, DZ);
+  tgt = orbitTarget();
+  dist = span * 2.05;
+  rotY = 0.72; rotX = 0.52;
+  // fit() already defines a complete orbit view, so adopt the mode directly
+  // instead of re-deriving it from the previous camera (which may be unset).
+  camMode = "orbit";
+  keys = {};
+  var C = camera();
+  eye = [C.eye[0], C.eye[1], C.eye[2]];
+  freePitch = Math.asin(Math.max(-1, Math.min(1, C.fwd[1])));
+  freeYaw = Math.atan2(C.fwd[0], C.fwd[2]);
+  syncModeBtn();
+}
+
+function norm(v){
+  var l = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]) || 1;
+  return [v[0]/l, v[1]/l, v[2]/l];
+}
+function cross(a,b){
+  return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+
+// Resolves eye position and an orthonormal camera basis for the active mode.
+function camera(){
+  var e, f;
+  if (camMode === "orbit"){
+    e = [
+      tgt[0] + dist*Math.cos(rotX)*Math.sin(rotY),
+      tgt[1] + dist*Math.sin(rotX),
+      tgt[2] + dist*Math.cos(rotX)*Math.cos(rotY)
+    ];
+    f = norm([tgt[0]-e[0], tgt[1]-e[1], tgt[2]-e[2]]);
+  } else {
+    e = eye;
+    var cp = Math.cos(freePitch);
+    f = norm([Math.sin(freeYaw)*cp, Math.sin(freePitch), Math.cos(freeYaw)*cp]);
+  }
+  var r = cross(f, [0,1,0]);
+  if (Math.abs(r[0]) + Math.abs(r[1]) + Math.abs(r[2]) < 1e-6) r = [1,0,0];
+  r = norm(r);
+  return { eye:e, fwd:f, right:r, up:norm(cross(r, f)) };
+}
+
+// Switching modes carries the current view across so the camera never jumps.
+function setMode(m){
+  if (m === camMode) return;
+  var C = camera();
+  if (m === "free"){
+    eye = [C.eye[0], C.eye[1], C.eye[2]];
+    freePitch = Math.asin(Math.max(-1, Math.min(1, C.fwd[1])));
+    freeYaw = Math.atan2(C.fwd[0], C.fwd[2]);
+    autoRot = false;
+  } else {
+    tgt = orbitTarget();
+    var dx = C.eye[0]-tgt[0], dy = C.eye[1]-tgt[1], dz = C.eye[2]-tgt[2];
+    var span = Math.max(DX, DY, DZ);
+    dist = Math.max(span*0.4, Math.sqrt(dx*dx + dy*dy + dz*dz));
+    rotX = Math.asin(Math.max(-1, Math.min(1, dy/Math.max(1e-6, dist))));
+    rotY = Math.atan2(dx, dz);
+  }
+  camMode = m;
+  keys = {};
+  syncModeBtn();
+}
+
+// Screen-space pan: moves the orbit target (or the camera itself when free).
+function panBy(dx, dy){
+  var C = camera();
+  var k = (camMode === "orbit" ? dist : Math.max(DX, DY, DZ)) * 0.0018;
+  var mx = -dx*k, my = dy*k;
+  var mv = [
+    C.right[0]*mx + C.up[0]*my,
+    C.right[1]*mx + C.up[1]*my,
+    C.right[2]*mx + C.up[2]*my
+  ];
+  var t = (camMode === "orbit") ? tgt : eye;
+  t[0]+=mv[0]; t[1]+=mv[1]; t[2]+=mv[2];
+}
+
+// Continuous movement while keys / pad buttons are held (free mode only).
+function moveFree(dt){
+  var C = camera();
+  var sp = Math.max(DX, DY, DZ) * 0.6 * dt * (keys.boost ? 2.8 : 1);
+  var d = [0,0,0];
+  if (keys.fwd)  { d[0]+=C.fwd[0];   d[1]+=C.fwd[1];   d[2]+=C.fwd[2]; }
+  if (keys.back) { d[0]-=C.fwd[0];   d[1]-=C.fwd[1];   d[2]-=C.fwd[2]; }
+  if (keys.right){ d[0]+=C.right[0]; d[1]+=C.right[1]; d[2]+=C.right[2]; }
+  if (keys.left) { d[0]-=C.right[0]; d[1]-=C.right[1]; d[2]-=C.right[2]; }
+  if (keys.up)   d[1] += 1;
+  if (keys.down) d[1] -= 1;
+  var l = Math.sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+  if (l < 1e-6) return;
+  eye[0] += d[0]/l*sp; eye[1] += d[1]/l*sp; eye[2] += d[2]/l*sp;
+}
+
+function resize(){
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width  = Math.floor(cv.clientWidth  * dpr);
+  cv.height = Math.floor(cv.clientHeight * dpr);
+  gl.viewport(0, 0, cv.width, cv.height);
+}
+
+// --- tiny mat4 -------------------------------------------------------------
+function mul(a,b){
+  var o = new Float32Array(16);
+  for (var r=0;r<4;r++) for (var c=0;c<4;c++){
+    var s=0; for (var k=0;k<4;k++) s += a[k*4+c]*b[r*4+k];
+    o[r*4+c]=s;
+  }
+  return o;
+}
+function persp(fovy, asp, zn, zf){
+  var f = 1/Math.tan(fovy/2), nf = 1/(zn-zf);
+  return new Float32Array([f/asp,0,0,0, 0,f,0,0, 0,0,(zf+zn)*nf,-1, 0,0,2*zf*zn*nf,0]);
+}
+function lookAt(ex,ey,ez, cx,cy,cz){
+  var zx=ex-cx, zy=ey-cy, zz=ez-cz;
+  var zl=Math.sqrt(zx*zx+zy*zy+zz*zz); zx/=zl; zy/=zl; zz/=zl;
+  var ux=0, uy=1, uz=0;
+  var xx=uy*zz-uz*zy, xy=uz*zx-ux*zz, xz=ux*zy-uy*zx;
+  var xl=Math.sqrt(xx*xx+xy*xy+xz*xz);
+  if (xl < 1e-6){ xx=1; xy=0; xz=0; } else { xx/=xl; xy/=xl; xz/=xl; }
+  var yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+  return new Float32Array([
+    xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*ex+xy*ey+xz*ez), -(yx*ex+yy*ey+yz*ez), -(zx*ex+zy*ey+zz*ez), 1
+  ]);
+}
+
+function loop(t){
+  var dt = lastT ? Math.min(0.05, (t - lastT)/1000) : 0.016;
+  lastT = t;
+  if (camMode === "orbit"){
+    if (autoRot) rotY += 0.19 * dt;
+  } else {
+    moveFree(dt);
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function draw(){
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  var C = camera();
+  var e = C.eye, f = C.fwd;
+  var asp = cv.width / Math.max(1, cv.height);
+  var span = Math.max(DX, DY, DZ);
+  // Near/far derived from the eye's actual distance to the model, so depth
+  // precision stays usable in both modes (and you can fly inside the build).
+  var ox = tgt[0] - e[0], oy = tgt[1] - e[1], oz = tgt[2] - e[2];
+  var dc = Math.sqrt(ox*ox + oy*oy + oz*oz);
+  var zn = Math.max(0.08, dc - span);
+  var zf = dc + span * 2.5;
+  var P = persp(50*Math.PI/180, asp, zn, zf);
+  var V = lookAt(e[0], e[1], e[2], e[0]+f[0], e[1]+f[1], e[2]+f[2]);
+  var MVP = mul(P, V);
+  gl.uniformMatrix4fv(uMVP, false, MVP);
+  gl.uniform3f(uEye, e[0], e[1], e[2]);
+  gl.uniform1f(uSpan, span);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufAll);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 20, 0);
+  gl.enableVertexAttribArray(aShade);
+  gl.vertexAttribPointer(aShade, 1, gl.FLOAT, false, 20, 12);
+  gl.enableVertexAttribArray(aCol);
+  gl.vertexAttribPointer(aCol, 4, gl.UNSIGNED_BYTE, true, 20, 16);
+
+  gl.drawArrays(gl.TRIANGLES, 0, VERT_N);
+}
+
+// ---- input ---------------------------------------------------------------
+function bindInput(){
+  var drag=false, lx=0, ly=0, panning=false;
+
+  cv.addEventListener("mousedown", function(e){
+    drag=true; lx=e.clientX; ly=e.clientY;
+    // Shift-drag (or middle button) pans instead of rotating.
+    panning = e.shiftKey || e.button===1;
+    if (camMode==="orbit") { autoRot=false; syncRotBtn(); }
+  });
+  window.addEventListener("mouseup", function(){ drag=false; panning=false; });
+  window.addEventListener("mousemove", function(e){
+    if(!drag) return;
+    var dx=e.clientX-lx, dy=e.clientY-ly; lx=e.clientX; ly=e.clientY;
+    if (panning){ panBy(dx, dy); return; }
+    if (camMode==="orbit"){
+      rotY -= dx*0.0072;
+      rotX = Math.max(-1.5, Math.min(1.5, rotX + dy*0.0072));
+    } else {
+      // Free look: drag turns the head.
+      freeYaw -= dx*0.0042;
+      freePitch = Math.max(-1.5, Math.min(1.5, freePitch - dy*0.0042));
+    }
+  });
+
+  cv.addEventListener("wheel", function(e){
+    e.preventDefault();
+    var span = Math.max(DX,DY,DZ);
+    if (camMode==="orbit"){
+      dist *= (e.deltaY > 0 ? 1.09 : 0.917);
+      dist = Math.max(span*0.12, Math.min(dist, span*7));
+    } else {
+      // Free mode: wheel flies along the view direction.
+      var C = camera();
+      var k = (e.deltaY > 0 ? -1 : 1) * span * 0.055;
+      eye[0]+=C.fwd[0]*k; eye[1]+=C.fwd[1]*k; eye[2]+=C.fwd[2]*k;
+    }
+  }, {passive:false});
+
+  // ---- touch: 1 finger = look/rotate, 2 fingers = pinch zoom + pan --------
+  var tPrev=null, pinch=0, twoPrev=null;
+  cv.addEventListener("touchstart", function(e){
+    if (camMode==="orbit"){ autoRot=false; syncRotBtn(); }
+    if (e.touches.length===1){
+      tPrev={x:e.touches[0].clientX, y:e.touches[0].clientY};
+    } else if (e.touches.length===2){
+      pinch = tdist(e); twoPrev = tmid(e);
+    }
+  }, {passive:true});
+  cv.addEventListener("touchmove", function(e){
+    e.preventDefault();
+    if (e.touches.length===1 && tPrev){
+      var t=e.touches[0];
+      var dx=t.clientX-tPrev.x, dy=t.clientY-tPrev.y;
+      if (camMode==="orbit"){
+        rotY -= dx*0.0088;
+        rotX = Math.max(-1.5, Math.min(1.5, rotX + dy*0.0088));
+      } else {
+        freeYaw -= dx*0.005;
+        freePitch = Math.max(-1.5, Math.min(1.5, freePitch - dy*0.005));
+      }
+      tPrev={x:t.clientX, y:t.clientY};
+    } else if (e.touches.length===2){
+      var d=tdist(e), m=tmid(e), span=Math.max(DX,DY,DZ);
+      if (pinch){
+        var ratio = pinch/Math.max(1,d);
+        if (camMode==="orbit"){
+          dist *= ratio;
+          dist = Math.max(span*0.12, Math.min(dist, span*7));
+        } else {
+          var C=camera(), k=(1-ratio)*span*0.9;
+          eye[0]+=C.fwd[0]*k; eye[1]+=C.fwd[1]*k; eye[2]+=C.fwd[2]*k;
+        }
+      }
+      // Two-finger drag pans in both modes.
+      if (twoPrev) panBy(m.x-twoPrev.x, m.y-twoPrev.y);
+      pinch=d; twoPrev=m;
+    }
+  }, {passive:false});
+  cv.addEventListener("touchend", function(e){
+    if(e.touches.length===0){ tPrev=null; pinch=0; twoPrev=null; }
+  }, {passive:true});
+
+  function tdist(e){
+    var a=e.touches[0], b=e.touches[1];
+    return Math.sqrt(Math.pow(a.clientX-b.clientX,2)+Math.pow(a.clientY-b.clientY,2));
+  }
+  function tmid(e){
+    var a=e.touches[0], b=e.touches[1];
+    return {x:(a.clientX+b.clientX)/2, y:(a.clientY+b.clientY)/2};
+  }
+
+  // ---- keyboard ----------------------------------------------------------
+  var KEYMAP = {
+    w:"fwd", s:"back", a:"left", d:"right",
+    arrowup:"fwd", arrowdown:"back", arrowleft:"left", arrowright:"right",
+    q:"down", e:"up", " ":"up"
+  };
+  window.addEventListener("keydown", function(e){
+    var k = e.key.toLowerCase();
+    if (k==="r"){ if(camMode==="orbit"){ autoRot=!autoRot; syncRotBtn(); } return; }
+    if (k==="f"){ fit(); return; }
+    if (k==="v"){ setMode(camMode==="orbit"?"free":"orbit"); return; }
+    if (k==="shift"){ keys.boost=true; return; }
+    var m = KEYMAP[k];
+    if (m){
+      // Movement keys imply free flight; switch automatically.
+      if (camMode!=="free") setMode("free");
+      keys[m]=true;
+      e.preventDefault();
+    }
+  });
+  window.addEventListener("keyup", function(e){
+    var k=e.key.toLowerCase();
+    if (k==="shift"){ keys.boost=false; return; }
+    var m=KEYMAP[k];
+    if (m) keys[m]=false;
+  });
+  window.addEventListener("blur", function(){ keys={}; });
+
+  // ---- on-screen fly pad (touch devices have no keyboard) ----------------
+  Array.prototype.forEach.call(document.querySelectorAll("#fly button"), function(b){
+    var mv = b.getAttribute("data-mv");
+    var press = function(ev){ ev.preventDefault(); keys[mv]=true; };
+    var release = function(){ keys[mv]=false; };
+    b.addEventListener("touchstart", press, {passive:false});
+    b.addEventListener("touchend", release, {passive:true});
+    b.addEventListener("touchcancel", release, {passive:true});
+    b.addEventListener("mousedown", press);
+    b.addEventListener("mouseup", release);
+    b.addEventListener("mouseleave", release);
+  });
+
+  // ---- buttons -----------------------------------------------------------
+  document.getElementById("bMode").onclick = function(){
+    setMode(camMode==="orbit" ? "free" : "orbit");
+  };
+  document.getElementById("bRot").onclick = function(){
+    if (camMode!=="orbit") setMode("orbit");
+    autoRot=!autoRot; syncRotBtn();
+  };
+  document.getElementById("bTop").onclick = function(){
+    setMode("orbit"); rotX=1.35; rotY=0.79; autoRot=false; syncRotBtn();
+  };
+  document.getElementById("bIso").onclick = function(){
+    setMode("orbit"); rotX=0.52; rotY=0.72; autoRot=false; syncRotBtn();
+  };
+  document.getElementById("bFit").onclick = function(){ fit(); };
+  document.getElementById("bShot").onclick = function(){
+    draw();
+    try{
+      var a=document.createElement("a");
+      a.download = "minebench-build.png";
+      a.href = cv.toDataURL("image/png");
+      a.click();
+    }catch(err){ alert("截图失败: "+err.message); }
+  };
+}
+
+function syncRotBtn(){
+  var b=document.getElementById("bRot");
+  if (camMode!=="orbit"){ b.textContent="⏸ 暂停旋转"; b.className=""; return; }
+  b.textContent = autoRot ? "⏸ 暂停旋转" : "▶ 继续旋转";
+  b.className = autoRot ? "on" : "";
+}
+
+function syncModeBtn(){
+  var b=document.getElementById("bMode");
+  var pad=document.getElementById("fly");
+  var hint=document.getElementById("hintTxt");
+  if (!b) return;
+  if (camMode==="free"){
+    b.textContent="🕊 自由视角";
+    b.className="mode";
+    if (pad) pad.className="panel on";
+    if (hint) hint.innerHTML='拖动 = 转视角 &nbsp;·&nbsp; 双指 = 缩放/平移 &nbsp;·&nbsp; <kbd>WASD</kbd> 移动 &nbsp;·&nbsp; <kbd>V</kbd> 切换';
+  } else {
+    b.textContent="🔄 环绕视角";
+    b.className="";
+    if (pad) pad.className="panel";
+    if (hint) hint.innerHTML='拖动 = 旋转 &nbsp;·&nbsp; 滚轮/双指 = 缩放 &nbsp;·&nbsp; <kbd>V</kbd> 自由视角 &nbsp;·&nbsp; <kbd>F</kbd> 重置';
+  }
+  syncRotBtn();
+}
+
+// ---- UI -----------------------------------------------------------------
+function fillUI(){
+  document.getElementById("ttl").textContent = META.prompt || "MineBench 体素构建";
+  var kb = (Math.max(DX,DY,DZ));
+  document.getElementById("mt").innerHTML =
+    "<b>" + COUNT.toLocaleString() + "</b> 方块 &nbsp;·&nbsp; <b>" +
+    faceCount.toLocaleString() + "</b> 可见面 &nbsp;·&nbsp; <b>" +
+    META.typeCount + "</b> 种材质<br>" +
+    "尺寸 " + DX + "×" + DY + "×" + DZ +
+    " &nbsp;·&nbsp; 生成于 " + META.generated;
+
+  // legend sorted by usage
+  var cnt = {};
+  for (var i=0;i<COUNT;i++) cnt[ts[i]] = (cnt[ts[i]]||0)+1;
+  var rows = Object.keys(cnt).map(function(k){ return [k|0, cnt[k]]; })
+    .sort(function(a,b){ return b[1]-a[1]; });
+  var lg = document.getElementById("legend");
+  lg.innerHTML = rows.map(function(r){
+    var p = PALETTE[r[0]];
+    return '<div class="row"><span class="sw" style="background:rgb('+p[1]+','+p[2]+','+p[3]+')"></span>'
+      + '<span>'+p[0]+'</span><span class="n">'+r[1].toLocaleString()+'</span></div>';
+  }).join("");
+}
+
+// ---- bootstrap ------------------------------------------------------------
+// Runs last so every `var` initialiser above has already executed.
+if (gl) init();
+</script>
+</body>
+</html>

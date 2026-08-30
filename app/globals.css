@@ -1,0 +1,1677 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* Colors (HSL channels) */
+    --bg: 0 0% 99%;
+    --bg2: 220 20% 97%;
+    --card: 0 0% 100%;
+    --card2: 220 20% 98%;
+    --border: 220 16% 86%;
+    --fg: 222 28% 10%;
+    --muted: 222 10% 36%;
+    --muted2: 222 8% 52%;
+
+    /* Brand + status */
+    --accent: 152 70% 38%;
+    --accent2: 282 82% 62%;
+    --danger: 0 80% 52%;
+    --warn: 40 95% 52%;
+    --success: 152 60% 34%;
+
+    /* The canvas renders with alpha, so this is the sky behind every build. */
+    --viewer-bg: 220 20% 97%;
+
+    /* Background effects */
+    --bg-halo-opacity: 0.45;
+    --bg-grid-opacity: 0.26;
+
+    --acc-expand: 250ms;
+    --acc-collapse: 250ms;
+    --acc-chevron: 250ms;
+    --acc-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  /* Dark has to be correct on the very first paint, before the theme script
+     runs — otherwise the page flashes light. The media query covers the
+     no-choice-yet case; the attribute selector lets an explicit choice win in
+     either direction. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+    --bg: 222 35% 6%;
+    --bg2: 224 40% 4%;
+    --card: 223 28% 10%;
+    --card2: 223 24% 12%;
+    --border: 223 18% 18%;
+    --fg: 220 25% 96%;
+    --muted: 220 10% 72%;
+    --muted2: 220 9% 56%;
+
+    --accent: 168 88% 52%;
+    --accent2: 282 82% 68%;
+    --danger: 0 80% 62%;
+    --warn: 40 95% 58%;
+    --success: 152 70% 44%;
+
+    /* Lifted off the page background so near-black blocks (birds, dark wool)
+       still read against the sky. */
+    --viewer-bg: 222 24% 12%;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: 222 35% 6%;
+    --bg2: 224 40% 4%;
+    --card: 223 28% 10%;
+    --card2: 223 24% 12%;
+    --border: 223 18% 18%;
+    --fg: 220 25% 96%;
+    --muted: 220 10% 72%;
+    --muted2: 220 9% 56%;
+
+    --accent: 168 88% 52%;
+    --accent2: 282 82% 68%;
+    --danger: 0 80% 62%;
+    --warn: 40 95% 58%;
+    --success: 152 70% 44%;
+
+    /* Lifted off the page background so near-black blocks (birds, dark wool)
+       still read against the sky. */
+    --viewer-bg: 222 24% 12%;
+  }
+
+  html,
+  body {
+    min-height: 100%;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-sans), system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background-color: hsl(var(--bg));
+    color: hsl(var(--fg));
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body:has(#mb-lab-canvas) .mb-bg-grid,
+  body:has(#mb-lab-canvas) .mb-bg-halo {
+    display: none;
+  }
+
+  body:has(#mb-lab-canvas) #mb-shell {
+    background-color: hsl(var(--bg));
+  }
+
+  body:has(#mb-lab-canvas) #mb-footer {
+    display: none;
+  }
+
+  button,
+  a,
+  [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body.mb-page-fixed {
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  body.mb-page-fixed #mb-shell {
+    height: 100dvh;
+  }
+
+  body.mb-page-fixed #mb-container {
+    min-height: 0;
+  }
+
+  body.mb-page-fixed #main {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  body.mb-page-fixed #mb-footer {
+    flex-shrink: 0;
+  }
+
+  ::selection {
+    background: hsl(var(--accent) / 0.22);
+    color: hsl(var(--fg));
+  }
+
+  @keyframes mb-fade-in-up {
+    0% {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* Opacity-only fade for table cells; transform would shift table layout. */
+  @keyframes mb-col-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Spread-curve draw-in: the line traces itself on mount, then the area
+     fills, then the endpoint dots pop in. pathLength="1" on the <path>
+     lets stroke-dasharray use normalized units. */
+  @keyframes mb-curve-line-draw {
+    from { stroke-dashoffset: 1; }
+    to { stroke-dashoffset: 0; }
+  }
+
+  @keyframes mb-curve-area-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes mb-curve-endpoint-pop {
+    from { opacity: 0; transform: scale(0.4); }
+    to { opacity: 1; transform: scale(1); }
+  }
+
+  .mb-curve-line-draw {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+    animation: mb-curve-line-draw 900ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+
+  .mb-curve-area-fade {
+    opacity: 0;
+    animation: mb-curve-area-fade 500ms ease-out 400ms forwards;
+  }
+
+  .mb-curve-endpoint {
+    opacity: 0;
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: mb-curve-endpoint-pop 300ms cubic-bezier(0.22, 1, 0.36, 1) 900ms forwards;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-curve-line-draw,
+    .mb-curve-area-fade,
+    .mb-curve-endpoint {
+      animation: none;
+      stroke-dashoffset: 0;
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes mb-caret-blink {
+    0%,
+    49% {
+      opacity: 1;
+    }
+    50%,
+    100% {
+      opacity: 0;
+    }
+  }
+
+  @keyframes mb-reveal-in {
+    0% {
+      opacity: 0;
+      transform: translateY(4px) scale(0.96);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes mb-card-enter {
+    0% {
+      opacity: 0;
+      transform: translateY(12px) scale(0.98);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes mb-curve-sweep {
+    0%,
+    100% {
+      transform: translate3d(0, 0, 0) scale(1);
+      opacity: 0.68;
+    }
+    50% {
+      transform: translate3d(0, -8px, 0) scale(1.012);
+      opacity: 0.92;
+    }
+  }
+
+  @keyframes mb-panel-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.004);
+      opacity: 0.96;
+    }
+  }
+
+  @keyframes mb-sheen-pass {
+    0% {
+      transform: translateX(-130%) skewX(-16deg);
+      opacity: 0;
+    }
+    20% {
+      opacity: 0.65;
+    }
+    100% {
+      transform: translateX(150%) skewX(-16deg);
+      opacity: 0;
+    }
+  }
+
+  @keyframes mb-progress-wait-slide {
+    0% {
+      transform: translateX(-115%);
+    }
+    100% {
+      transform: translateX(130%);
+    }
+  }
+}
+
+@layer components {
+  .mb-panel {
+    @apply relative overflow-hidden rounded-md border border-border;
+  }
+
+  .mb-panel-pulse {
+    animation: mb-panel-pulse 13s ease-in-out infinite;
+    transform-origin: center top;
+  }
+
+  .mb-panel-pulse-slow {
+    animation-duration: 17s;
+  }
+
+  .mb-leaderboard-header {
+    @apply sticky top-0 z-10 border-b border-border px-3 py-2.5 tracking-[0.16em] backdrop-blur-md sm:px-4 sm:py-3;
+    background-color: hsl(var(--bg) / 0.88);
+    box-shadow: inset 0 -1px 0 hsl(var(--border) / 0.35);
+    transition: background-color 180ms ease-out, color 180ms ease-out;
+    /* Keep header row height stable when detail columns toggle in/out.
+       Without this, narrowing columns can wrap labels onto 2 lines and
+       the whole header jumps in height. */
+    min-height: 3rem;
+  }
+
+  .mb-leaderboard-header-model {
+    @apply font-semibold tracking-[0.18em];
+    color: hsl(var(--fg) / 0.82);
+  }
+
+  .mb-leaderboard-search-input::-webkit-search-cancel-button,
+  .mb-leaderboard-search-input::-webkit-search-decoration {
+    display: none;
+    -webkit-appearance: none;
+  }
+
+  .mb-leaderboard-skeleton-block {
+    position: relative;
+    overflow: hidden;
+    background-color: hsl(var(--border) / 0.32);
+  }
+
+  .mb-leaderboard-skeleton-shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(
+      100deg,
+      transparent 20%,
+      hsl(var(--fg) / 0.08) 50%,
+      transparent 80%
+    );
+    animation: mb-sheen-pass 1.6s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+    animation-delay: var(--mb-skeleton-delay, 0s);
+  }
+
+  .mb-leaderboard-skeleton-row:nth-child(4n + 2) {
+    --mb-skeleton-delay: -0.4s;
+  }
+
+  .mb-leaderboard-skeleton-row:nth-child(4n + 3) {
+    --mb-skeleton-delay: -0.8s;
+  }
+
+  .mb-leaderboard-skeleton-row:nth-child(4n) {
+    --mb-skeleton-delay: -1.2s;
+  }
+
+  /* Applied to the optional detail columns (th + td) so they fade in when
+     the Details toggle flips on. The header row's min-height keeps its
+     size stable across the toggle, so only the cell contents animate. */
+  .mb-leaderboard-detail-col {
+    animation: mb-col-fade-in 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .mb-leaderboard-table[data-details="open"] .mb-leaderboard-row {
+    transition-duration: 260ms;
+  }
+
+  .mb-details-toggle {
+    transition-property: transform, background-color, color, box-shadow;
+    transition-duration: 180ms;
+    transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .mb-details-toggle:active {
+    transform: translateY(1px) scale(0.98);
+  }
+
+  /* Fade-in the retry button when a refresh actually fails so it doesn't
+     pop harshly into the stable header row. */
+  .mb-refresh-retry {
+    animation: mb-fade-in-up 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-leaderboard-detail-col,
+    .mb-refresh-retry {
+      animation: none;
+    }
+
+    .mb-leaderboard-skeleton-shimmer::after {
+      animation: none;
+      opacity: 0;
+    }
+
+    .mb-details-toggle {
+      transition: none;
+    }
+
+    .mb-details-toggle:active {
+      transform: none;
+    }
+  }
+
+  .mb-leaderboard-col-label {
+    color: hsl(var(--muted2));
+  }
+
+  .mb-col-help {
+    cursor: help;
+    --mb-help-x: -50%;
+  }
+
+  .mb-col-help:focus-visible {
+    outline: 2px solid hsl(var(--accent) / 0.5);
+    outline-offset: -2px;
+  }
+
+  .mb-col-help-label {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-bottom: 1px dotted hsl(var(--muted2) / 0.55);
+    line-height: 1.05;
+    /* Prevent column headers from wrapping to two lines when detail columns
+       toggle in and shrink each column's width. Labels are short enough
+       ("Rating", "Consistency", "Coverage", etc.) that nowrap is safe. */
+    white-space: nowrap;
+  }
+
+  .mb-col-help::after {
+    content: attr(data-help);
+    position: absolute;
+    z-index: 60;
+    left: 50%;
+    top: calc(100% + 8px);
+    width: min(24rem, 42vw);
+    transform: translateX(var(--mb-help-x)) translateY(-4px);
+    opacity: 0;
+    pointer-events: none;
+    padding: 0.52rem 0.64rem;
+    border-radius: 0.65rem;
+    background: hsl(var(--card) / 0.97);
+    color: hsl(var(--fg) / 0.95);
+    border: 1px solid hsl(var(--border) / 0.8);
+    box-shadow: 0 14px 30px -24px hsl(220 35% 2% / 1);
+    font-size: 0.69rem;
+    font-weight: 500;
+    line-height: 1.35;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    text-align: left;
+    white-space: normal;
+    transition: opacity 140ms ease-out, transform 140ms ease-out;
+  }
+
+  .mb-col-help:hover::after,
+  .mb-col-help:focus-visible::after,
+  .mb-col-help:active::after {
+    opacity: 1;
+    transform: translateX(var(--mb-help-x)) translateY(0);
+  }
+
+  .mb-col-help[data-help-align="left"]::after {
+    left: 0;
+    --mb-help-x: 0;
+  }
+
+  .mb-col-help[data-help-align="right"]::after {
+    left: auto;
+    right: 0;
+    --mb-help-x: 0;
+  }
+
+  @media (hover: none) {
+    .mb-col-help::after {
+      width: min(20rem, 78vw);
+    }
+  }
+
+  .mb-leaderboard-cell {
+    vertical-align: middle;
+  }
+
+  .mb-leaderboard-rating-stack {
+    display: grid;
+    justify-items: center;
+    row-gap: 0.08rem;
+    line-height: 1.05;
+  }
+
+  .mb-leaderboard-rating-primary {
+    font-size: 0.875rem;
+    line-height: 1.08;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .mb-leaderboard-rating-detail {
+    display: grid;
+    grid-template-rows: 0fr;
+    min-height: 0;
+    color: hsl(var(--muted2));
+    font-size: 0.6875rem;
+    line-height: 1.15;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+    opacity: 0;
+    transform: translateY(-3px);
+    transition:
+      grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1),
+      opacity 180ms ease-out,
+      transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .mb-leaderboard-rating-detail > span {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .mb-leaderboard-rating-detail-open {
+    grid-template-rows: 1fr;
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .mb-leaderboard-rating-detail-closed {
+    pointer-events: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-leaderboard-rating-detail {
+      transition: none;
+      transform: none;
+    }
+  }
+
+  .mb-leaderboard-model-cell {
+    position: relative;
+  }
+
+  .mb-leaderboard-model-cell::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    top: 18%;
+    bottom: 18%;
+    width: 1px;
+    background: linear-gradient(to bottom, transparent, hsl(var(--border) / 0.5), transparent);
+    opacity: 0.7;
+  }
+
+  .mb-leaderboard-row {
+    @apply cursor-pointer border-b border-border/65 outline-none;
+    transition-property: transform, background-color, box-shadow, border-color;
+    transition-duration: 220ms;
+    transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+    transform: translate3d(0, 0, 0);
+    will-change: transform;
+  }
+
+  .mb-leaderboard-row:hover {
+    background-color: hsl(var(--bg) / 0.3);
+    box-shadow:
+      inset 0 0 0 1px hsl(var(--accent) / 0.16),
+      0 12px 28px -26px hsl(var(--accent) / 0.5);
+  }
+
+  .mb-leaderboard-row[data-tier="champion"] {
+    background-image: linear-gradient(
+      90deg,
+      hsl(var(--accent) / 0.1) 0%,
+      transparent 45%,
+      hsl(var(--accent2) / 0.08) 100%
+    );
+  }
+
+  .mb-leaderboard-row[data-tier="top"] {
+    background-image: linear-gradient(90deg, hsl(var(--accent) / 0.05) 0%, transparent 70%);
+  }
+
+  .mb-leaderboard-row:hover .mb-leaderboard-votes-meta {
+    color: hsl(var(--fg) / 0.9);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .mb-leaderboard-row:hover {
+      transform: translateY(-2px);
+    }
+
+    .mb-leaderboard-row:hover .mb-leaderboard-outcome-chip {
+      transform: translateY(-1px) scale(1.02);
+    }
+  }
+
+  .mb-leaderboard-row:focus-visible {
+    background-color: hsl(var(--bg) / 0.38);
+    outline: 2px solid hsl(var(--accent) / 0.6);
+    outline-offset: -2px;
+  }
+
+  .mb-leaderboard-outcome-chip {
+    @apply inline-flex h-7 items-center justify-center rounded-full px-2.5 py-0.5 text-center;
+    min-width: 3.25rem;
+    box-shadow: inset 0 0 0 1px hsl(var(--border) / 0.35);
+    transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .mb-leaderboard-record-grid {
+    display: inline-grid;
+    width: 100%;
+    margin-inline: auto;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: center;
+    justify-content: center;
+    column-gap: 0.26rem;
+  }
+
+  .mb-leaderboard-record-chip {
+    min-width: 0;
+    width: 100%;
+    height: 1.42rem;
+    padding-inline: 0.38rem;
+    font-size: 10px;
+    letter-spacing: 0.01em;
+    line-height: 1;
+  }
+
+  .mb-leaderboard-votes-meta {
+    font-size: 0.67rem;
+    line-height: 1.15;
+    letter-spacing: 0.02em;
+    transition: color 180ms ease-out;
+  }
+
+  .mb-leaderboard-votes-stack {
+    display: grid;
+    justify-items: center;
+    row-gap: 0.2rem;
+  }
+
+  .mb-leaderboard-votes-total {
+    font-size: 0.8rem;
+    line-height: 1.1;
+  }
+
+  .mb-leaderboard-outcome-chip-success {
+    background-color: hsl(var(--success) / 0.2);
+    color: hsl(var(--success));
+    box-shadow: inset 0 0 0 1px hsl(var(--success) / 0.3);
+  }
+
+  .mb-leaderboard-outcome-chip-danger {
+    background-color: hsl(var(--danger) / 0.15);
+    color: hsl(var(--danger));
+    box-shadow: inset 0 0 0 1px hsl(var(--danger) / 0.28);
+  }
+
+  .mb-leaderboard-outcome-chip-muted {
+    background-color: hsl(var(--bg) / 0.56);
+    color: hsl(var(--muted));
+  }
+
+  .mb-jump-chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium text-muted ring-1 ring-border/70;
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+    background: linear-gradient(to bottom, hsl(var(--bg) / 0.62), hsl(var(--bg) / 0.48));
+    transition-property: background-color, color, box-shadow, border-color;
+    transition-duration: 200ms;
+  }
+
+  .mb-jump-chip:hover {
+    background-color: hsl(var(--bg) / 0.8);
+    color: hsl(var(--fg));
+    --tw-ring-color: hsl(var(--accent) / 0.35);
+    box-shadow: 0 10px 26px -24px hsl(var(--accent) / 0.65);
+  }
+
+  .mb-jump-chip:focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 2px hsl(var(--accent) / 0.45),
+      0 14px 32px -26px hsl(var(--accent) / 0.8);
+  }
+
+  .mb-jump-chip-dot {
+    @apply h-1 w-1 rounded-full bg-muted/80;
+    transition: background-color 200ms ease-out;
+  }
+
+  .mb-jump-chip:hover .mb-jump-chip-dot,
+  .mb-jump-chip:focus-visible .mb-jump-chip-dot {
+    background-color: hsl(var(--accent));
+  }
+
+  /* Flat metric row — no boxes, no vertical dividers. Rhythm comes from
+     top + bottom hairlines that bracket the group, plus an internal mid-rule
+     after the first row on wide screens. Columns separate via grid gap
+     alone; typography carries the rest. */
+  .mb-metric-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 1.25rem;
+    row-gap: 0;
+    border-top: 1px solid hsl(var(--border) / 0.45);
+    border-bottom: 1px solid hsl(var(--border) / 0.45);
+  }
+
+  @media (min-width: 640px) {
+    .mb-metric-row {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      column-gap: 1.5rem;
+    }
+  }
+
+  .mb-metric-tile {
+    padding: 0.65rem 0 0.7rem;
+    position: relative;
+  }
+
+  /* Single mid-rule between the two rows. On 2-col mobile this kicks in
+     after the second tile (row break); on 4-col desktop it kicks in after
+     the fourth. */
+  .mb-metric-tile:nth-child(-n + 2) {
+    border-bottom: 1px solid hsl(var(--border) / 0.35);
+  }
+
+  @media (min-width: 640px) {
+    .mb-metric-tile:nth-child(-n + 2) {
+      border-bottom: none;
+    }
+    .mb-metric-tile:nth-child(-n + 4) {
+      border-bottom: 1px solid hsl(var(--border) / 0.35);
+    }
+  }
+
+  .mb-curve-tooltip {
+    @apply pointer-events-none -translate-y-full transform-gpu rounded-md bg-card px-3 py-2 text-xs ring-1 ring-border;
+    transition: opacity 150ms ease-out;
+  }
+
+  .mb-curve-tooltip-left {
+    transform: translate(0, -100%);
+  }
+
+  .mb-curve-tooltip-center {
+    transform: translate(-50%, -100%);
+  }
+
+  .mb-curve-tooltip-right {
+    transform: translate(-100%, -100%);
+  }
+
+  .mb-head-to-head-card {
+    @apply rounded-md p-3.5 ring-1 ring-border/60;
+    transition-property: box-shadow, background-color, ring-color;
+    transition-duration: 200ms;
+  }
+
+  .mb-head-to-head-card:hover,
+  .mb-head-to-head-card:focus-within {
+    background-color: hsl(var(--fg) / 0.04);
+    border-color: hsl(var(--accent) / 0.24);
+  }
+
+  .mb-panel-inner {
+    @apply relative;
+  }
+
+
+  .mb-sheen-surface {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  .mb-sheen-surface::after {
+    display: none;
+  }
+
+  .mb-subpanel {
+    @apply rounded-md border border-border/70;
+  }
+
+  .mb-badge {
+    @apply inline-flex items-center gap-2 rounded-md px-3 py-1 text-xs font-medium text-muted ring-1 ring-border/80;
+  }
+
+  /* Shared eyebrow label used across sections to label a region without a
+     heavy pill. Mono + uppercase + letter-spaced at a mute level. */
+  .mb-eyebrow {
+    @apply font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-muted/70 sm:text-[11px];
+  }
+
+  /* Accent-tinted step marker (e.g. 01/02/03 in the pipeline diagram). Sized
+     to sit inline with an eyebrow label. */
+  .mb-step-num {
+    @apply rounded-md border border-accent/25 bg-accent/[0.08] px-1.5 py-0.5 font-mono text-[11px] font-medium text-accent;
+  }
+
+  .mb-dot {
+    @apply h-1.5 w-1.5 rounded-sm bg-accent shadow-[0_0_0_3px_hsl(var(--accent)_/_0.18)];
+  }
+
+  .mb-field {
+    @apply w-full rounded-md border border-border bg-bg px-3 text-sm text-fg outline-none transition;
+  }
+
+  select.mb-field {
+    appearance: none;
+    padding-right: 2.5rem;
+    background-image:
+      linear-gradient(45deg, transparent 42%, hsl(var(--muted)) 43% 57%, transparent 58%),
+      linear-gradient(135deg, transparent 42%, hsl(var(--muted)) 43% 57%, transparent 58%);
+    background-position:
+      calc(100% - 1.5rem) 50%,
+      calc(100% - 1.1875rem) 50%;
+    background-repeat: no-repeat;
+    background-size: 0.3125rem 0.3125rem;
+  }
+
+  select.mb-field.mb-select-trailing-action {
+    padding-right: 5rem;
+    background-position:
+      calc(100% - 4.25rem) 50%,
+      calc(100% - 3.9375rem) 50%;
+  }
+
+  .mb-field:focus-visible {
+    border-color: hsl(var(--accent) / 0.55);
+    box-shadow: 0 0 0 3px hsl(var(--accent) / 0.16);
+  }
+
+  .mb-feedback {
+    @apply rounded-md border px-3 py-3 text-sm text-fg;
+  }
+
+  .mb-feedback-error {
+    @apply border-danger/30 bg-danger/[0.08];
+  }
+
+  .mb-feedback-status {
+    @apply border-accent/30 bg-accent/[0.08];
+  }
+
+  @media (forced-colors: active) {
+    select.mb-field {
+      appearance: auto;
+      background-image: none;
+      padding-right: 0.75rem;
+    }
+
+    select.mb-field.mb-select-trailing-action {
+      padding-right: 5rem;
+    }
+  }
+
+  #mb-lab-canvas .mb-field {
+    border-radius: 0.375rem;
+    background-color: hsl(var(--bg));
+    box-shadow: none;
+  }
+
+  .mb-btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-semibold text-fg focus-visible:outline-none;
+    transition:
+      background-image 140ms ease-out,
+      background-color 140ms ease-out,
+      box-shadow 140ms ease-out,
+      transform 140ms cubic-bezier(0.22, 1, 0.36, 1),
+      color 120ms ease-out;
+  }
+
+  .mb-btn:focus-visible {
+    box-shadow: 0 0 0 3px hsl(var(--accent) / 0.22);
+  }
+
+  .mb-btn:active:not(:disabled) {
+    transform: translateY(1px) scale(0.985);
+    transition-duration: 60ms;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-btn {
+      transition: none;
+    }
+    .mb-btn:hover:not(:disabled),
+    .mb-btn:active:not(:disabled) {
+      transform: none;
+    }
+  }
+
+  .mb-btn-primary {
+    @apply ring-1 ring-accent/45;
+    background-color: hsl(var(--accent) / 0.14);
+  }
+
+  .mb-btn-primary:hover:not(:disabled) {
+    @apply ring-accent/70;
+    background-color: hsl(var(--accent) / 0.22);
+  }
+
+  .mb-btn-primary:active:not(:disabled) {
+    @apply ring-accent/70;
+    background-color: hsl(var(--accent) / 0.30);
+  }
+
+  .mb-btn-ghost {
+    @apply ring-1 ring-border/80;
+    background-color: transparent;
+  }
+
+  .mb-btn-ghost:hover:not(:disabled) {
+    @apply ring-border;
+    background-color: hsl(var(--fg) / 0.05);
+  }
+
+  .mb-btn-ghost:active:not(:disabled) {
+    @apply ring-border;
+    background-color: hsl(var(--fg) / 0.09);
+  }
+
+  .mb-btn-danger {
+    @apply ring-1 ring-danger/45;
+    background-color: hsl(var(--danger) / 0.12);
+  }
+
+  .mb-btn-danger:hover {
+    background-color: hsl(var(--danger) / 0.20);
+  }
+
+  /* Prompt disclosure. Overlays the builds instead of pushing them down —
+     a reflow here would stall the Three.js canvas mid-transition. Transform
+     and opacity only, so it composites. */
+  .mb-prompt-reveal {
+    opacity: 0;
+    transform: translateY(-0.375rem);
+    transform-origin: top center;
+    pointer-events: none;
+    visibility: hidden;
+    transition:
+      opacity 160ms cubic-bezier(0.22, 1, 0.36, 1),
+      transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+      visibility 0s linear 200ms;
+  }
+
+  .mb-prompt-reveal.is-open {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+    visibility: visible;
+    transition:
+      opacity 140ms cubic-bezier(0.22, 1, 0.36, 1),
+      transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+      visibility 0s;
+  }
+
+  /* Flip rather than rotate: a symmetric chevron passes through a flat line
+     at the midpoint, which reads as the control inverting, not spinning. */
+  .mb-disclosure-chevron {
+    transform: scaleY(1);
+    transform-origin: center;
+    transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .mb-disclosure-chevron path {
+    vector-effect: non-scaling-stroke;
+  }
+
+  .mb-disclosure-chevron.is-open {
+    transform: scaleY(-1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-prompt-reveal,
+    .mb-prompt-reveal.is-open,
+    .mb-disclosure-chevron {
+      transition: none;
+      transform: none;
+    }
+  }
+
+  .mb-viewer-stage {
+    background-color: hsl(var(--viewer-bg));
+  }
+
+  #mb-lab-canvas .mb-btn {
+    border-radius: 0.375rem;
+    box-shadow: none;
+  }
+
+  #mb-lab-canvas .mb-btn-primary {
+    background-color: hsl(var(--accent) / 0.12);
+    background-image: none;
+  }
+
+  #mb-lab-canvas .mb-btn-ghost {
+    background-color: transparent;
+    background-image: none;
+  }
+
+  @keyframes mb-status-change {
+    from {
+      opacity: 0.45;
+      transform: translateY(2px) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  .mb-status-change {
+    transform-origin: left center;
+    animation: mb-status-change 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-status-change {
+      animation: none;
+    }
+  }
+
+  /* grid-template-rows 0fr → 1fr gives a clean height animation
+     with no JS measurement; the inner element clips overflow. */
+  .t-acc-panel {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows var(--acc-collapse) var(--acc-ease);
+  }
+  .t-acc[data-open="true"] .t-acc-panel {
+    grid-template-rows: 1fr;
+    transition: grid-template-rows var(--acc-expand) var(--acc-ease);
+  }
+  .t-acc-panel-inner {
+    overflow: hidden;
+    opacity: 0;
+    filter: blur(2px);
+    transition:
+      opacity var(--acc-collapse) var(--acc-ease),
+      filter var(--acc-collapse) var(--acc-ease);
+  }
+  .t-acc[data-open="true"] .t-acc-panel-inner {
+    opacity: 1;
+    filter: blur(0);
+    transition:
+      opacity var(--acc-expand) var(--acc-ease),
+      filter var(--acc-expand) var(--acc-ease);
+  }
+  /* Flip the chevron vertically to turn the "v" into a "^".
+     scaleY(-1) about the centre passes through a flat line at
+     the midpoint (same look as a `d:` path morph) but animates
+     in every browser, unlike CSS `d:` morphing (Chromium only).
+     The chevron path is symmetric about the 16x16 viewBox
+     centre, so the flip lands exactly on the "^"; non-scaling
+     -stroke keeps the stroke width constant through the flip. */
+  .t-acc-chevron {
+    display: inline-flex;
+    transform: scaleY(1);
+    transform-origin: center;
+    transition:
+      transform var(--acc-chevron) var(--acc-ease),
+      color 140ms ease-out;
+  }
+  .t-acc-chevron path { vector-effect: non-scaling-stroke; }
+  .t-acc[data-open="true"] .t-acc-chevron {
+    transform: scaleY(-1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .t-acc-panel, .t-acc-panel-inner, .t-acc-chevron {
+      transition: none !important;
+    }
+  }
+
+  .mb-kbd {
+    @apply rounded-md border border-border/80 bg-bg/50 px-1.5 py-0.5 font-mono text-[11px] text-muted;
+  }
+
+  .mb-chip {
+    @apply inline-flex select-none items-center gap-2 rounded-full bg-bg/55 px-3 py-1.5 text-sm font-medium text-fg ring-1 ring-border/80 transition duration-150 ease-out;
+  }
+
+  .mb-chip:hover {
+    @apply bg-bg/70;
+  }
+
+  .mb-chip[aria-pressed="true"] {
+    @apply bg-accent/16 ring-accent/45;
+  }
+
+  .mb-chip[disabled] {
+    @apply cursor-not-allowed opacity-55;
+  }
+
+  .mb-collapse-toggle {
+    @apply inline-flex items-center justify-center rounded-full bg-bg/60 px-3 py-1.5 text-xs font-semibold text-fg ring-1 ring-border/80 transition duration-200;
+    will-change: transform;
+  }
+
+  .mb-collapse-toggle:hover {
+    --tw-ring-color: hsl(var(--accent) / 0.36);
+    background-color: hsl(var(--fg) / 0.05);
+  }
+
+  .mb-clamp-3 {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    overflow: hidden;
+    word-break: break-word;
+  }
+
+  .mb-clamp-prompt {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+    overflow: hidden;
+    word-break: break-word;
+  }
+
+  .mb-clamp-prompt-tight {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    overflow: hidden;
+    word-break: break-word;
+  }
+
+  @media (min-width: 768px) {
+    .mb-clamp-prompt {
+      -webkit-line-clamp: 6;
+    }
+
+    .mb-clamp-prompt-tight {
+      -webkit-line-clamp: 2;
+    }
+  }
+
+  .mb-prompt-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--accent) / 0.45) hsl(var(--bg) / 0.3);
+  }
+
+  .mb-prompt-scroll::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .mb-prompt-scroll::-webkit-scrollbar-track {
+    background: hsl(var(--bg) / 0.25);
+    border-radius: 999px;
+  }
+
+  .mb-prompt-scroll::-webkit-scrollbar-thumb {
+    background: hsl(var(--accent) / 0.55);
+    border-radius: 999px;
+    border: 1px solid hsl(var(--border) / 0.75);
+  }
+
+  .mb-lab-scroll {
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted2) / 0.35) transparent;
+  }
+
+  .mb-lab-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .mb-lab-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .mb-lab-scroll::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: hsl(var(--muted2) / 0.3);
+  }
+
+  .mb-x-scroll {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    scroll-padding-inline: 0.25rem;
+  }
+
+  .mb-x-scroll::-webkit-scrollbar {
+    display: none;
+  }
+
+  @media (min-width: 640px) {
+    .mb-leaderboard-scroll {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+
+    .mb-leaderboard-scroll::-webkit-scrollbar {
+      width: 0;
+      height: 0;
+    }
+  }
+
+  .mb-carousel-track {
+    position: relative;
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: hsl(var(--accent) / 0.20);
+    border: 1px solid hsl(var(--border) / 0.75);
+    touch-action: none;
+    user-select: none;
+    cursor: ew-resize;
+  }
+
+  .mb-carousel-thumb {
+    position: absolute;
+    top: -5px;
+    height: 14px;
+    min-width: 36px;
+    border-radius: 999px;
+    background: hsl(var(--card));
+    border: 1px solid hsl(var(--border));
+    transition: background 150ms ease;
+  }
+
+  .mb-carousel-track:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px hsl(var(--accent) / 0.28);
+  }
+
+  .mb-mobile-stage-switcher {
+    display: grid;
+    gap: 0.42rem;
+  }
+
+  .mb-mobile-stage-toggle {
+    @apply rounded-md p-1 ring-1 ring-border/70;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.18rem;
+  }
+
+  .mb-mobile-stage-tab {
+    @apply rounded-[0.3rem] px-3 py-2.5 text-center ring-1 ring-transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    transition:
+      transform 180ms ease,
+      border-color 180ms ease,
+      background-color 180ms ease,
+      color 180ms ease;
+  }
+
+  .mb-mobile-stage-tab:active {
+    transform: translateY(1px);
+  }
+
+  .mb-mobile-stage-tab:focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 3px hsl(var(--accent) / 0.16),
+      inset 0 0 0 1px hsl(var(--accent) / 0.28);
+  }
+
+  .mb-mobile-stage-tab-active {
+    border-color: hsl(var(--accent) / 0.28);
+    background: hsl(var(--accent) / 0.12);
+  }
+
+  .mb-mobile-stage-label {
+    font-family: var(--font-mono), monospace;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: hsl(var(--muted2));
+  }
+
+  .mb-mobile-stage-tab-active .mb-mobile-stage-label {
+    color: hsl(var(--fg) / 0.94);
+  }
+
+  .mb-mobile-stage-hint {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: hsl(var(--muted2) / 0.84);
+  }
+
+  .mb-mobile-stage-hint-line {
+    width: 1.8rem;
+    height: 1px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, transparent, hsl(var(--muted2) / 0.55), transparent);
+  }
+
+  .mb-progress-wait {
+    position: relative;
+    display: block;
+    overflow: hidden;
+    border-radius: inherit;
+  }
+
+  .mb-progress-wait::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: 42%;
+    border-radius: inherit;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      hsl(var(--accent) / 0.45) 28%,
+      hsl(var(--accent2) / 0.6) 52%,
+      hsl(var(--accent) / 0.45) 72%,
+      transparent 100%
+    );
+    animation: mb-progress-wait-slide 1.2s linear infinite;
+  }
+
+  .mb-fade-in {
+    animation: mb-fade-in-up 220ms ease-out both;
+  }
+
+  .mb-caret {
+    display: inline-block;
+    width: 0.55ch;
+    margin-left: 0.15ch;
+    transform: translateY(0.06em);
+  }
+
+  .mb-caret::after {
+    content: "▍";
+    color: hsl(var(--accent) / 0.85);
+    animation: mb-caret-blink 1.05s steps(1, end) infinite;
+  }
+
+  /* once typing completes, keep a tiny hint then fade caret away */
+  .mb-caret-idle::after {
+    animation-duration: 0.9s;
+    animation-iteration-count: 2;
+  }
+
+  /* hidden model pill */
+  .mb-hidden-pill {
+    @apply inline-flex items-center gap-1.5 rounded-full bg-muted/10 px-2.5 py-1 text-xs font-medium text-muted ring-1 ring-border/60;
+  }
+
+  /* model reveal animation */
+  .mb-model-reveal {
+    @apply inline-flex items-center rounded-full bg-bg/60 px-2.5 py-1 text-xs font-medium ring-1 ring-border/60;
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+
+  .mb-model-reveal-in {
+    animation: mb-reveal-in 260ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+
+  /* card entrance animation */
+  .mb-card-enter {
+    animation: mb-card-enter 340ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .mb-dialog[open],
+  .mb-dialog-panel {
+    transform-origin: center;
+    animation: mb-card-enter 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .mb-dialog[open]::backdrop,
+  .mb-dialog-backdrop {
+    animation: mb-col-fade-in 180ms ease-out both;
+  }
+
+  .mb-card-enter-delay {
+    animation-delay: 60ms;
+  }
+
+  /* One transitioned state, not a pulse that ends and then snaps back into a
+     separate static glow — that double hit is what read as a stutter. */
+  #mb-arena .mb-reveal-highlight-a,
+  #mb-arena .mb-reveal-highlight-b {
+    transition:
+      border-color 320ms cubic-bezier(0.22, 1, 0.36, 1) 60ms,
+      box-shadow 320ms cubic-bezier(0.22, 1, 0.36, 1) 60ms;
+  }
+
+  #mb-arena .mb-reveal-highlight-a {
+    --reveal-tone: var(--accent);
+    border-color: hsl(var(--accent) / 0.55);
+    box-shadow: inset 0 0 0 1px hsl(var(--accent) / 0.35);
+  }
+
+  #mb-arena .mb-reveal-highlight-b {
+    --reveal-tone: var(--accent2);
+    border-color: hsl(var(--accent2) / 0.55);
+    box-shadow: inset 0 0 0 1px hsl(var(--accent2) / 0.35);
+  }
+
+  /* The payoff: two rings ripple off the winning build and fade. They live on
+     pseudo-elements so the resting highlight above is never animated — that
+     hand-off from animation back to a static glow is what used to stutter.
+     Transform and opacity only, and the 1.4% swell stays inside the column
+     gap, so it cannot touch the other build. */
+  .mb-reveal-highlight-a::before,
+  .mb-reveal-highlight-a::after,
+  .mb-reveal-highlight-b::before,
+  .mb-reveal-highlight-b::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    border: 1px solid hsl(var(--reveal-tone) / 0.85);
+    pointer-events: none;
+    transform-origin: center;
+    animation: mb-reveal-ripple 820ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .mb-reveal-highlight-a::after,
+  .mb-reveal-highlight-b::after {
+    animation-delay: 140ms;
+  }
+
+  @keyframes mb-reveal-ripple {
+    0% {
+      opacity: 0.9;
+      transform: scale(1);
+    }
+    100% {
+      opacity: 0;
+      transform: scale(1.014);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-reveal-highlight-a::before,
+    .mb-reveal-highlight-a::after,
+    .mb-reveal-highlight-b::before,
+    .mb-reveal-highlight-b::after {
+      animation: none;
+      opacity: 0;
+    }
+  }
+
+  /* Reveal lanes arrive as one beat, A then B. */
+  @keyframes mb-lane-in {
+    from {
+      opacity: 0;
+      transform: translateY(3px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  .mb-reveal-lane {
+    animation: mb-lane-in 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .mb-reveal-lane-delay {
+    animation-delay: 70ms;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-reveal-lane {
+      animation: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    .mb-model-reveal-in,
+    .mb-card-enter,
+    .mb-dialog[open],
+    .mb-dialog-panel,
+    .mb-dialog[open]::backdrop,
+    .mb-dialog-backdrop,
+    .mb-fade-in {
+      animation: none;
+      opacity: 1;
+      transform: none;
+    }
+
+    .mb-reveal-highlight-a,
+    .mb-reveal-highlight-b {
+      animation: none;
+    }
+
+    .mb-progress-wait::before {
+      animation: none;
+    }
+
+    .mb-panel-pulse {
+      animation: none;
+    }
+
+    .mb-jump-chip:hover,
+    .mb-head-to-head-card:hover,
+    .mb-metric-tile:hover,
+    .mb-leaderboard-outcome-chip {
+      transform: none;
+    }
+  }
+
+  /* vote button variants */
+  .mb-vote-a,
+  .mb-vote-b,
+  .mb-vote-tie,
+  .mb-vote-bad,
+  .mb-vote-skip {
+    transition:
+      background 160ms ease-out,
+      box-shadow 160ms ease-out,
+      transform 140ms cubic-bezier(0.22, 1, 0.36, 1),
+      color 120ms ease-out;
+  }
+
+  @keyframes mb-vote-confirm {
+    0% {
+      box-shadow: inset 0 0 0 1px hsl(var(--vote-confirm-color, var(--accent)) / 0);
+      background-color: hsl(var(--vote-confirm-color, var(--accent)) / 0.14);
+    }
+    22% {
+      box-shadow: inset 0 0 0 1px hsl(var(--vote-confirm-color, var(--accent)) / 0.85);
+      background-color: hsl(var(--vote-confirm-color, var(--accent)) / 0.42);
+    }
+    100% {
+      box-shadow: inset 0 0 0 1px hsl(var(--vote-confirm-color, var(--accent)) / 0);
+      background-color: hsl(var(--vote-confirm-color, var(--accent)) / 0.14);
+    }
+  }
+
+  .mb-vote-confirmed {
+    animation: mb-vote-confirm 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .mb-vote-a.mb-vote-confirmed {
+    --vote-confirm-color: var(--accent);
+  }
+  .mb-vote-b.mb-vote-confirmed {
+    --vote-confirm-color: var(--accent2);
+  }
+  .mb-vote-bad.mb-vote-confirmed {
+    --vote-confirm-color: var(--danger);
+  }
+  .mb-vote-tie.mb-vote-confirmed,
+  .mb-vote-skip.mb-vote-confirmed {
+    --vote-confirm-color: var(--fg);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-vote-confirmed {
+      animation: none;
+      box-shadow: 0 0 0 3px hsl(var(--vote-confirm-color, var(--accent)) / 0.35);
+    }
+  }
+
+  .mb-vote-a:active:not(:disabled),
+  .mb-vote-b:active:not(:disabled),
+  .mb-vote-tie:active:not(:disabled),
+  .mb-vote-bad:active:not(:disabled),
+  .mb-vote-skip:active:not(:disabled) {
+    transform: translateY(0) scale(0.985);
+    transition-duration: 60ms;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mb-vote-a,
+    .mb-vote-b,
+    .mb-vote-tie,
+    .mb-vote-bad,
+    .mb-vote-skip {
+      transition: none;
+    }
+    .mb-vote-a:hover:not(:disabled),
+    .mb-vote-b:hover:not(:disabled),
+    .mb-vote-tie:hover:not(:disabled),
+    .mb-vote-bad:hover:not(:disabled),
+    .mb-vote-skip:hover:not(:disabled),
+    .mb-vote-a:active:not(:disabled),
+    .mb-vote-b:active:not(:disabled),
+    .mb-vote-tie:active:not(:disabled),
+    .mb-vote-bad:active:not(:disabled),
+    .mb-vote-skip:active:not(:disabled) {
+      transform: none;
+    }
+  }
+
+  .mb-vote-a {
+    @apply ring-1 ring-accent/45;
+    background: hsl(var(--accent) / 0.14);
+  }
+
+  .mb-vote-a:hover:not(:disabled) {
+    @apply ring-accent/70;
+    background: hsl(var(--accent) / 0.22);
+  }
+
+  .mb-vote-a:active:not(:disabled) {
+    background: hsl(var(--accent) / 0.30);
+  }
+
+  .mb-vote-b {
+    @apply ring-1 ring-accent2/45;
+    background: hsl(var(--accent2) / 0.14);
+  }
+
+  .mb-vote-b:hover:not(:disabled) {
+    @apply ring-accent2/70;
+    background: hsl(var(--accent2) / 0.22);
+  }
+
+  .mb-vote-b:active:not(:disabled) {
+    background: hsl(var(--accent2) / 0.30);
+  }
+
+  .mb-vote-tie {
+    @apply ring-1 ring-border/70;
+    background: transparent;
+  }
+
+  .mb-vote-tie:hover:not(:disabled) {
+    @apply ring-border;
+    background: hsl(var(--fg) / 0.05);
+  }
+
+  .mb-vote-tie:active:not(:disabled) {
+    background: hsl(var(--fg) / 0.09);
+  }
+
+  .mb-vote-bad {
+    @apply ring-1 ring-danger/35;
+    background: hsl(var(--danger) / 0.09);
+  }
+
+  .mb-vote-bad:hover:not(:disabled) {
+    @apply ring-danger/55;
+    background: hsl(var(--danger) / 0.16);
+  }
+
+  .mb-vote-bad:active:not(:disabled) {
+    background: hsl(var(--danger) / 0.22);
+  }
+
+  .mb-vote-skip {
+    @apply ring-1 ring-border/60;
+    background: transparent;
+  }
+
+  .mb-vote-skip:hover:not(:disabled) {
+    @apply ring-border/80;
+    background: hsl(var(--fg) / 0.05);
+  }
+
+  .mb-vote-skip:active:not(:disabled) {
+    background: hsl(var(--fg) / 0.09);
+  }
+}

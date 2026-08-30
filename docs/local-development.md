@@ -1,0 +1,229 @@
+# MineBench Local Development
+
+Use this guide to run MineBench locally, configure provider keys, and work on the app without digging through the top-level README.
+
+## Prerequisites
+
+- Node.js `18+`
+- `pnpm`
+- Docker (for local Postgres)
+
+## Install Dependencies
+
+```bash
+pnpm install
+```
+
+## Create an Env File
+
+```bash
+cp .env.example .env
+```
+
+## Start the App and Database
+
+```bash
+pnpm dev:setup
+```
+
+`pnpm dev:setup` will:
+- ensure `.env` exists
+- build the texture atlas
+- reset local Docker Postgres volume
+- run Prisma migrations
+- start Next.js dev server on `http://localhost:3000`
+
+## Seed the Local Database
+
+In a second terminal:
+
+```bash
+pnpm prompt --import
+```
+
+Then open:
+- `http://localhost:3000/` (Arena)
+- `http://localhost:3000/sandbox`
+- `http://localhost:3000/leaderboard`
+
+## Alternative Startup
+
+If you do not want to reset the DB volume each time:
+
+```bash
+pnpm db:up
+pnpm prisma:migrate
+pnpm dev
+```
+
+## Live Generation
+
+To generate fresh builds in `/sandbox`:
+
+1. Open `http://localhost:3000/sandbox`
+2. Switch to `Generate`
+3. Enter either:
+   - an `OpenRouter` key, or
+   - provider-specific keys (OpenAI, Anthropic, Gemini, Moonshot, DeepSeek, MiniMax, xAI)
+4. Pick 2 models and click `Generate`
+
+Notes:
+- Keys entered in Sandbox are stored in browser `localStorage` and sent only with that request.
+- In production, `/api/generate` requires request keys unless `MINEBENCH_ALLOW_SERVER_KEYS=1`.
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and set what you need.
+
+### Core
+
+- `DATABASE_URL` (required): pooled/runtime Postgres URL
+- `DIRECT_URL` (required): direct Postgres URL for Prisma migrations
+- `ADMIN_TOKEN` (required for `/api/admin/*`)
+- `CRON_SECRET` (recommended if using Vercel Cron for `/api/admin/rank-snapshots/capture`)
+- `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` (required for large build upload/download via Supabase Storage)
+- `SUPABASE_STORAGE_BUCKET` (optional, default `builds`)
+- `SUPABASE_STORAGE_PREFIX` (optional, default `imports`)
+
+### Provider Keys
+
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `GOOGLE_AI_API_KEY`
+- `MOONSHOT_API_KEY`
+- `DEEPSEEK_API_KEY`
+- `MINIMAX_API_KEY`
+- `XAI_API_KEY`
+- `META_MODEL_API_KEY`
+- `ZAI_API_KEY`
+- `OPENROUTER_API_KEY`
+- `MINEBENCH_FREE_OPENROUTER_API_KEY` (server-only key for the signed-in Gemini 3.7 Flash promotion)
+
+### Optional Provider and Runtime Tuning
+
+- `MINEBENCH_ALLOW_SERVER_KEYS=1` (production opt-in for server env keys in `/api/generate`)
+- `ANTHROPIC_FABLE_5_EFFORT=low|medium|high|xhigh|max`
+- `ANTHROPIC_OPUS_5_EFFORT=low|medium|high|xhigh|max`
+- `ANTHROPIC_SONNET_5_EFFORT=low|medium|high|xhigh|max`
+- `ANTHROPIC_OPUS_4_8_EFFORT=low|medium|high|xhigh|max`
+- `ANTHROPIC_OPUS_4_7_EFFORT=low|medium|high|xhigh|max`
+- `ANTHROPIC_OPUS_4_6_EFFORT=low|medium|high|max`
+- `ANTHROPIC_SONNET_4_6_EFFORT=low|medium|high|max` (runtime falls back automatically if provider rejects `max`)
+- `ANTHROPIC_STREAM_RESPONSES=1`
+- `OPENAI_STREAM_RESPONSES=1` (applies to live-delta callers; batch generation uses non-streamed Responses JSON)
+- `OPENAI_USE_BACKGROUND_MODE=1` (recommended for long-running Responses jobs; defaults on for `gpt-5*` when not streaming deltas)
+- `OPENAI_BACKGROUND_POLL_MS=2000` (poll interval for background mode)
+- `ANTHROPIC_ENABLE_1M_CONTEXT_BETA=1`
+- `ANTHROPIC_THINKING_BUDGET` (legacy/manual thinking models)
+- GPT 5.6 Sol uses the native OpenAI model ID `gpt-5.6-sol` through the Responses API with `reasoning.mode=pro`, defaults to `reasoning.effort=max`, and uses the model's 128000-token combined reasoning and output cap. Its OpenRouter fallback uses `openai/gpt-5.6-sol-pro` with max effort and strict structured output.
+- GPT 5.6 Luna uses the native OpenAI model ID `gpt-5.6-luna` through the Responses API with `reasoning.mode=pro`, defaults to `reasoning.effort=max`, and uses its 1050000-token context window and 128000-token combined reasoning and output cap. Its OpenRouter fallback uses `openai/gpt-5.6-luna-pro` with max effort and strict structured output.
+- Kimi K3 uses the native Moonshot model ID `kimi-k3`, always reasons with `reasoning_effort=max`, uses its 1048576-token completion ceiling, and omits its fixed sampling parameters. Its OpenRouter fallback uses `moonshotai/kimi-k3` with max effort and fails closed if that effort is rejected.
+- Claude Fable 5 uses the native Anthropic model ID `claude-fable-5`, supports always-on adaptive thinking with effort `low|medium|high|xhigh|max`, and MineBench defaults it to `max` with a 128000-token output cap.
+- Claude Opus 5 uses the native Anthropic model ID `claude-opus-5`, reaches its 1M-token context window without a beta header, supports adaptive thinking with effort `low|medium|high|xhigh|max`, and MineBench defaults it to `max` with a 128000-token output cap. Its OpenRouter fallback uses `anthropic/claude-opus-5` with the same cap and effort ladder.
+- Claude Sonnet 5 uses the native Anthropic model ID `claude-sonnet-5`, supports adaptive thinking with effort `low|medium|high|xhigh|max`, and MineBench defaults it to `max` with a 128000-token output cap.
+- Claude 4.8 Opus uses the native Anthropic model ID `claude-opus-4-8`, supports adaptive effort `low|medium|high|xhigh|max`, and MineBench defaults it to `max` with a 128000-token output cap.
+- Gemini 3.7 Flash uses the native Google AI model ID `gemini-3.7-flash`, supports `thinking_level=high|medium|low`, and MineBench defaults it to `high` with a 65536-token output cap. OpenRouter fallback uses `google/gemini-3.7-flash` with the same cap and mandatory reasoning.
+- Gemini 3.6 Flash uses the native Google AI model ID `gemini-3.6-flash`, supports `thinking_level=high|medium|low|minimal`, and MineBench defaults it to `high` with a 65536-token output cap. OpenRouter fallback uses `google/gemini-3.6-flash` with the same cap and highest reasoning effort.
+- Gemini 3.5 Flash-Lite uses the native Google AI model ID `gemini-3.5-flash-lite`, supports `thinking_level=high|medium|low|minimal`, and MineBench defaults it to `high` with a 65536-token output cap. OpenRouter fallback uses `google/gemini-3.5-flash-lite` with the same cap and highest reasoning effort.
+- Gemini 3.5 Flash uses the native Google AI model ID `gemini-3.5-flash`, supports `thinking_level=high|medium|low|minimal`, and MineBench defaults it to `high` with a 65536-token output cap.
+- Grok 4.3 uses the native xAI API, reasons automatically, rejects `reasoning_effort`, and uses a `max_tokens` request of up to 1000000 unless `MINEBENCH_MAX_OUTPUT_TOKENS` lowers it; MineBench does not send a thinking override for this model.
+- Grok 4.6 uses the native xAI API with `reasoning_effort=xhigh`, provider-default sampling, and `max_completion_tokens=496000`. The model has a 500000-token context window; live validation rejected a 500000-token output request and accepted 496000, so MineBench uses 496000 as the observed accepted request ceiling. OpenRouter fallback uses `x-ai/grok-4.6` with the same cap, effort, sampling policy, and strict `voxel.exec` schema.
+- Grok 4.5 uses the native xAI API with `reasoning_effort=high` and `max_completion_tokens=500000`. The token request is bounded by the model's 500000-token context window, so input and reasoning reduce the visible output available. OpenRouter fallback uses `x-ai/grok-4.5` with the same reasoning level and `max_tokens` request.
+- DeepSeek V4 Pro Preview uses the native DeepSeek API with JSON Output mode, defaults to `thinking=max` and `max_tokens=384000`; use `pnpm batch:generate --reasoning high` only when intentionally lowering effort.
+- DeepSeek V4 Flash 0731 uses the native DeepSeek model ID `deepseek-v4-flash`, supports `reasoning_effort=low|high|max`, and MineBench defaults to `max` with a 384000-token output cap. Its OpenRouter fallback uses the exact `deepseek/deepseek-v4-flash-0731` route and requests `max` reasoning first, with `high` and `low` fallbacks.
+- Qwen 3.8 Max is OpenRouter-only in MineBench and uses `qwen/qwen3.8-max`, with `xhigh|high|medium|low|minimal` reasoning efforts and `xhigh` by default. Its current OpenRouter output cap is 131072 tokens and its context window is 1M tokens.
+- GLM 5.3 uses the native Z.AI model ID `glm-5.3` on the OpenAI-compatible `/api/paas/v4` route, always thinks (`thinking.type=disabled` is rejected), supports `reasoning_effort=low|high|max`, and MineBench defaults it to `max` with a 131072-token output cap against its 1M-token context window. Its OpenRouter fallback uses `z-ai/glm-5.3` with the same cap and effort ladder, stepping down to `high` then `low`.
+- Muse Spark 1.2 uses the native Meta Model API model ID `muse-spark-1.2`, defaults to mandatory `reasoning_effort=xhigh`, and sends `max_completion_tokens=131072` with strict structured output. If no Meta key is available, or OpenRouter is explicitly preferred, MineBench uses `meta/muse-spark-1.2` without ever disabling reasoning.
+- `OPENROUTER_BASE_URL`, `MOONSHOT_BASE_URL`, `DEEPSEEK_BASE_URL`, `MINIMAX_BASE_URL`, `XAI_BASE_URL`, `META_MODEL_API_BASE_URL`, `ZAI_BASE_URL`
+- `AI_DEBUG=1` (logs raw model output on failures)
+- `MINEBENCH_TOOL_OUTPUT_DIR`, `MINEBENCH_TOOL_TIMEOUT_MS`, `MINEBENCH_TOOL_MAX_*` (advanced `voxel.exec` controls)
+
+## Useful Scripts
+
+- `pnpm dev:setup`: full local bootstrap
+- `pnpm dev`: start Next.js dev server
+- `pnpm build` / `pnpm start`: production build and serve
+- `pnpm lint`: ESLint
+- `pnpm test`: run the automated regression suite in `tests/`
+- `pnpm check`: run lint, tests, and a production build before pushing larger changes
+- `pnpm db:up` / `pnpm db:down` / `pnpm db:reset`
+- `pnpm prisma:migrate` / `pnpm prisma:dev` / `pnpm prisma:generate`
+- `pnpm atlas`: rebuild texture atlas
+- `pnpm prompt`: inspect or import prompt build files from `uploads/`
+- `pnpm batch:generate`: batch-generate and or upload build files
+- `pnpm elo:reset --yes [--keep-history]`: reset arena rating and leaderboard stats
+- `pnpm arena:load --base-url http://localhost:3000 --users 12 --duration 90`: simulate concurrent arena users
+
+## Quality Checks
+
+- `pnpm lint` for static checks
+- `pnpm test` for fast automated regression tests
+- `pnpm check` before pushing changes that should clear the full local gate
+
+## Arena Load Testing
+
+Use the load harness to reproduce the real arena path under concurrency:
+
+1. fetch `/api/arena/matchup?payload=adaptive`
+2. wait for both full builds to finish loading
+3. submit `/api/arena/vote`
+4. repeat with separate session cookies per virtual user
+
+Example runs:
+
+```bash
+pnpm arena:load --base-url http://localhost:3000 --users 12 --duration 90
+pnpm arena:load --base-url https://your-preview-url.vercel.app --users 16 --duration 120
+```
+
+Useful flags:
+
+- `--payload adaptive|inline|shell`
+- `--prompt-id` with a seeded prompt id if you want to pin the run to one prompt
+- `--think-ms 150`
+- `--matchup-timeout-ms 12000`
+- `--vote-timeout-ms 12000`
+- `--build-timeout-ms 35000`
+
+The summary includes:
+
+- round, matchup, vote, and full-hydration latency percentiles
+- timeout and error counts by stage
+- `Server-Timing` breakdowns from matchup, vote, and build responses
+- build source counts so you can see whether full hydration came from artifacts, live streams, or snapshot fallback
+
+For the most realistic production test:
+
+- point `--base-url` at the deployed preview or production URL
+- make sure the deployment is using the pooled runtime `DATABASE_URL`
+- precompute large build artifacts before the run so you measure the intended fast path
+
+## Project Structure
+
+```text
+assets/             source texture pack and other build inputs
+app/                Next.js App Router pages and API routes
+components/         UI and voxel viewer components
+lib/ai/             generation pipeline and provider adapters
+lib/arena/          matchup sampling and rating logic
+lib/blocks/         palette and texture atlas mapping
+lib/voxel/          voxel types, validation, mesh helpers
+prisma/             schema and migrations
+scripts/            setup, import, generation, maintenance utilities
+uploads/            local build JSON files and prompt folders
+```
+
+## Troubleshooting
+
+- `No seeded prompts found` on Arena:
+  - Run `pnpm prompt --import` or use `/api/admin/seed`.
+- `Missing ADMIN_TOKEN` or `Invalid token` on admin endpoints:
+  - Set `ADMIN_TOKEN` in `.env` and send `Authorization: Bearer $ADMIN_TOKEN`.
+- `/api/generate` returns no-key error in production:
+  - send `providerKeys` from client or set `MINEBENCH_ALLOW_SERVER_KEYS=1`.
+- large upload fails and script falls back to direct API body upload:
+  - set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and optionally `SUPABASE_STORAGE_BUCKET`.
+- DB connection errors:
+  - ensure Docker is running, `DATABASE_URL` and `DIRECT_URL` are valid, then run `pnpm db:up`.
+- missing or broken block textures:
+  - run `pnpm atlas` to rebuild `public/textures/atlas.png` from `assets/texture-pack/`.

@@ -1,0 +1,24 @@
+{
+  "crons": [
+    {
+      "path": "/api/admin/rank-snapshots/capture",
+      "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/admin/arena/drain-vote-jobs",
+      "schedule": "10,25,40,55 * * * *"
+    },
+    {
+      "path": "/api/admin/arena/drain-shown-jobs",
+      "schedule": "5,20,35,50 * * * *"
+    },
+    {
+      "path": "/api/admin/private-evaluations/purge",
+      "schedule": "17 3 * * *"
+    },
+    {
+      "path": "/api/admin/gallery/purge",
+      "schedule": "27 3 * * *"
+    }
+  ]
+}

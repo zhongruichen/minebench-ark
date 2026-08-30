@@ -1,0 +1,910 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum OrganizationRole {
+  ADMIN
+  MEMBER
+}
+
+enum StealthExportPolicy {
+  AGGREGATES_ONLY
+  DEIDENTIFIED_VOTES
+}
+
+enum StealthExperimentStatus {
+  DRAFT
+  GENERATING
+  READY
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
+enum StealthVariantStatus {
+  DRAFT
+  GENERATING
+  READY
+  ACTIVE
+  WITHDRAWN
+}
+
+enum StealthVariantSource {
+  ENDPOINT
+  UPLOAD
+}
+
+enum StealthGenerationRunStatus {
+  RUNNING
+  SUCCEEDED
+  PARTIAL
+  FAILED
+}
+
+enum StealthGenerationResultStatus {
+  QUEUED
+  GENERATING
+  VALIDATING
+  READY
+  FAILED
+}
+
+model User {
+  id                       String    @id @db.Uuid
+  email                    String    @unique
+  displayName              String?
+  publicNickname           String?   @db.VarChar(40)
+  publicNicknameNormalized String?   @unique @db.VarChar(40)
+  lastSeenAt               DateTime?
+  isMineBenchAdmin         Boolean   @default(false)
+  gallerySuspendedAt       DateTime?
+  gallerySuspensionReason  String?   @db.VarChar(240)
+  gallerySuspendedById     String?   @db.Uuid
+  galleryRestoredAt        DateTime?
+  totalGenerationCount     Int       @default(0)
+  hostedGenerationCount    Int       @default(0)
+  hostedGenerationLimit    Int       @default(100)
+  deletedAt                DateTime?
+  authDeletedAt            DateTime?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  memberships     OrganizationMembership[]
+  acceptedInvites OrganizationInvitation[] @relation("AcceptedOrganizationInvites")
+  votes           Vote[]
+  customBuilds    CustomBuild[]
+
+  gallerySuspendedBy       User?                     @relation("GallerySuspendingAdmin", fields: [gallerySuspendedById], references: [id], onDelete: SetNull)
+  gallerySuspendedUsers    User[]                    @relation("GallerySuspendingAdmin")
+  galleryCandidates        GalleryCandidate[]        @relation("GalleryCandidateUploader")
+  selectedGalleryCandidates GalleryCandidate[]       @relation("GalleryCandidateSelector")
+  galleryExamples          GalleryExample[]          @relation("GalleryExampleContributor")
+  galleryVotes             GalleryVote[]
+  publicSessionActivities  PublicSessionActivity[]
+  galleryModerationAuthored GalleryModerationRecord[] @relation("GalleryModerationActor")
+  galleryModerationSubjects GalleryModerationRecord[] @relation("GalleryModerationSubject")
+  galleryVoteBlocks        GalleryVoteBlock[]        @relation("GalleryVoteBlockSubject")
+  galleryVoteBlocksCreated GalleryVoteBlock[]        @relation("GalleryVoteBlockCreator")
+  galleryVoteBlocksReversed GalleryVoteBlock[]       @relation("GalleryVoteBlockReverser")
+
+  @@index([gallerySuspendedById])
+  @@index([deletedAt, authDeletedAt])
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships OrganizationMembership[]
+  invitations OrganizationInvitation[]
+  experiments StealthExperiment[]
+}
+
+model OrganizationMembership {
+  organizationId String
+  userId         String           @db.Uuid
+  role           OrganizationRole
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([organizationId, userId])
+  @@index([userId])
+}
+
+model OrganizationInvitation {
+  id             String           @id @default(cuid())
+  organizationId String
+  email          String
+  role           OrganizationRole
+  authUserId     String?          @db.Uuid
+  acceptedById   String?          @db.Uuid
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  acceptedBy   User?        @relation("AcceptedOrganizationInvites", fields: [acceptedById], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, email])
+  @@index([authUserId])
+  @@index([acceptedById])
+}
+
+model StealthExperiment {
+  id                    String                  @id @default(cuid())
+  organizationId        String
+  slug                  String
+  name                  String
+  status                StealthExperimentStatus @default(DRAFT)
+  exportPolicy          StealthExportPolicy     @default(AGGREGATES_ONLY)
+  targetDecisiveVotes   Int?
+  pauseAtGoal           Boolean                 @default(true)
+  retentionDays         Int                     @default(30)
+  agreementReference    String?
+  startsAt              DateTime?
+  checkpointSetFrozenAt DateTime?
+  endedAt               DateTime?
+  retentionDeleteAt     DateTime?
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+
+  organization  Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  variants      StealthVariant[]
+  cohortUploads StealthCohortUpload[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId, status])
+  @@index([status, retentionDeleteAt])
+}
+
+model StealthCohortUpload {
+  id           String   @id @db.Uuid
+  experimentId String
+  bucket       String
+  path         String
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  experiment StealthExperiment @relation(fields: [experimentId], references: [id], onDelete: Restrict)
+
+  @@unique([bucket, path])
+  @@index([experimentId, expiresAt])
+}
+
+model StealthVariant {
+  id                     String               @id @default(cuid())
+  experimentId           String
+  codename               String
+  source                 StealthVariantSource @default(ENDPOINT)
+  status                 StealthVariantStatus @default(DRAFT)
+  modelId                String               @unique
+  releasedModelId        String?
+  checkpointFingerprint  String?
+  endpointEnabled        Boolean              @default(false)
+  lastValidatedAt        DateTime?
+  cohortGeneratedAt      DateTime?
+  releasedAt             DateTime?
+  expectedBuildCount     Int                  @default(0)
+  generatedBuildCount    Int                  @default(0)
+  generationFailureCount Int                  @default(0)
+  lastGenerationError    String?
+
+  eloRating          Float @default(1500)
+  glickoRd           Float @default(350)
+  glickoVolatility   Float @default(0.06)
+  conservativeRating Float @default(800)
+  shownCount         Int   @default(0)
+  winCount           Int   @default(0)
+  lossCount          Int   @default(0)
+  drawCount          Int   @default(0)
+  bothBadCount       Int   @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  experiment     StealthExperiment          @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  model          Model                      @relation("StealthOpaqueModel", fields: [modelId], references: [id], onDelete: Restrict)
+  releasedModel  Model?                     @relation("StealthReleasedModel", fields: [releasedModelId], references: [id], onDelete: SetNull)
+  credential     StealthEndpointCredential?
+  generationRuns StealthGenerationRun[]
+  matchups       Matchup[]
+  voteJobs       ArenaVoteJob[]
+
+  @@unique([experimentId, codename])
+  @@index([experimentId, status])
+  @@index([releasedModelId])
+}
+
+model StealthEndpointCredential {
+  id              String   @id @default(cuid())
+  variantId       String   @unique
+  encryptedConfig String
+  fingerprint     String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  variant StealthVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+}
+
+model StealthGenerationRun {
+  id                  String                     @id @default(cuid())
+  variantId           String
+  status              StealthGenerationRunStatus @default(RUNNING)
+  workflowRunId       String?                    @unique
+  promptCohortId      String
+  configuration       Json
+  expectedBuildCount  Int
+  completedBuildCount Int                        @default(0)
+  failedBuildCount    Int                        @default(0)
+  providerCallCount   Int                        @default(0)
+  retryCount          Int                        @default(0)
+  startedAt           DateTime                   @default(now())
+  completedAt         DateTime?
+  error               String?
+
+  variant StealthVariant            @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  results StealthGenerationResult[]
+
+  @@index([variantId, startedAt])
+}
+
+model StealthGenerationResult {
+  id                   String                        @id @default(cuid())
+  runId                String
+  promptId             String
+  buildId              String?
+  status               StealthGenerationResultStatus
+  attempts             Int                           @default(0)
+  generationTimeMs     Int                           @default(0)
+  requestConfiguration String?
+  error                String?
+  createdAt            DateTime                      @default(now())
+  updatedAt            DateTime                      @updatedAt
+
+  run    StealthGenerationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  prompt Prompt               @relation(fields: [promptId], references: [id], onDelete: Restrict)
+  build  Build?               @relation(fields: [buildId], references: [id], onDelete: SetNull)
+
+  @@unique([runId, promptId])
+  @@index([promptId])
+  @@index([buildId])
+}
+
+enum CustomBuildStatus {
+  queued
+  running
+  succeeded
+  failed
+  canceled
+}
+
+enum CustomBuildJobType {
+  generate
+  export
+}
+
+enum CustomBuildJobStatus {
+  queued
+  running
+  succeeded
+  failed
+  canceled
+}
+
+enum CustomBuildArtifactKind {
+  build_json
+  preview_json
+  raw_text_debug
+  glb
+  stl
+  schem
+  preview_mbv4
+  viewer_mbv4
+  viewer_mbf1
+  preview_svg
+}
+
+enum CustomBuildStorageEncoding {
+  identity
+  gzip
+}
+
+model Model {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  provider    String
+  modelId     String
+  displayName String
+  enabled     Boolean  @default(true)
+  isBaseline  Boolean  @default(false)
+
+  eloRating     Float @default(1500)
+  glickoRd      Float @default(350)
+  glickoVolatility Float @default(0.06)
+  conservativeRating Float @default(800)
+  shownCount    Int   @default(0)
+  winCount      Int   @default(0)
+  lossCount     Int   @default(0)
+  drawCount     Int   @default(0)
+  bothBadCount  Int   @default(0)
+
+  builds Build[]
+  matchupsAsA Matchup[] @relation("MatchupModelA")
+  matchupsAsB Matchup[] @relation("MatchupModelB")
+  rankSnapshots ModelRankSnapshot[]
+  coverageByPrompt ArenaCoverageModelPrompt[]
+  coveragePairsLow ArenaCoveragePair[] @relation("ArenaCoveragePairLow")
+  coveragePairsHigh ArenaCoveragePair[] @relation("ArenaCoveragePairHigh")
+  coveragePairPromptsLow ArenaCoveragePairPrompt[] @relation("ArenaCoveragePairPromptLow")
+  coveragePairPromptsHigh ArenaCoveragePairPrompt[] @relation("ArenaCoveragePairPromptHigh")
+  shownJobs ArenaShownJob[]
+  stealthVariant StealthVariant? @relation("StealthOpaqueModel")
+  releasedStealthVariants StealthVariant[] @relation("StealthReleasedModel")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([enabled])
+  @@index([conservativeRating])
+}
+
+model ModelRankSnapshot {
+  id         String   @id @default(cuid())
+  capturedAt DateTime
+  rank       Int
+  rankScore  Float
+  confidence Int
+
+  modelId String
+  model   Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([capturedAt, modelId])
+  @@index([capturedAt])
+  @@index([capturedAt, rank])
+  @@index([modelId])
+}
+
+model Prompt {
+  id        String   @id @default(cuid())
+  text      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  builds  Build[]
+  matchups Matchup[]
+  coverageByModel ArenaCoverageModelPrompt[]
+  coveragePairs ArenaCoveragePairPrompt[]
+  stealthGenerationResults StealthGenerationResult[]
+  selectedGalleryCandidate GalleryCandidate?
+
+  @@unique([text])
+  @@index([active])
+}
+
+model Build {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  promptId String
+  prompt   Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  modelId String
+  model   Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  gridSize Int
+  palette  String
+  mode     String
+
+  voxelData         Json?
+  voxelStorageBucket String?
+  voxelStoragePath   String?
+  voxelStorageEncoding String?
+  voxelByteSize      Int?
+  voxelCompressedByteSize Int?
+  voxelSha256        String?
+  arenaBuildHints    Json?
+  blockCount        Int
+  generationTimeMs  Int
+
+  matchupsAsA Matchup[] @relation("MatchupBuildA")
+  matchupsAsB Matchup[] @relation("MatchupBuildB")
+  stealthGenerationResults StealthGenerationResult[]
+  arenaArtifacts ArenaBuildArtifact[]
+
+  @@unique([promptId, modelId, gridSize, palette, mode])
+  @@index([gridSize, palette, mode, promptId, modelId])
+  @@index([promptId])
+  @@index([modelId])
+}
+
+model ArenaBuildArtifact {
+  buildId   String
+  bucket    String
+  path      String
+  createdAt DateTime @default(now())
+
+  build Build @relation(fields: [buildId], references: [id], onDelete: Cascade)
+
+  @@id([buildId, bucket, path])
+  @@index([bucket, path])
+}
+
+model Matchup {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  samplingLane String?
+  samplingReason String?
+
+  promptId String
+  prompt   Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  modelAId String
+  modelA   Model @relation("MatchupModelA", fields: [modelAId], references: [id], onDelete: Restrict)
+
+  modelBId String
+  modelB   Model @relation("MatchupModelB", fields: [modelBId], references: [id], onDelete: Restrict)
+
+  buildAId String
+  buildA   Build @relation("MatchupBuildA", fields: [buildAId], references: [id], onDelete: Restrict)
+
+  buildBId String
+  buildB   Build @relation("MatchupBuildB", fields: [buildBId], references: [id], onDelete: Restrict)
+
+  stealthVariantId String?
+  stealthVariant   StealthVariant? @relation(fields: [stealthVariantId], references: [id], onDelete: Restrict)
+
+  votes Vote[]
+
+  @@index([promptId, createdAt])
+  @@index([modelAId])
+  @@index([modelBId])
+  @@index([stealthVariantId, createdAt])
+  @@index([samplingLane, createdAt])
+}
+
+model Vote {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  matchupId String
+  matchup   Matchup @relation(fields: [matchupId], references: [id], onDelete: Cascade)
+  jobs      ArenaVoteJob[]
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  sessionId String
+  choice    String
+
+  @@unique([matchupId, sessionId])
+  @@index([userId, createdAt])
+  @@index([sessionId])
+  @@index([createdAt])
+  @@index([createdAt, id])
+  @@index([matchupId, createdAt])
+}
+
+model ArenaVoteJob {
+  id          String    @id @default(cuid())
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  voteId  String @unique
+  vote    Vote   @relation(fields: [voteId], references: [id], onDelete: Cascade)
+
+  matchupId String
+  promptId  String
+  modelAId  String
+  modelBId  String
+  choice    String
+
+  stealthVariantId String?
+  stealthVariant   StealthVariant? @relation(fields: [stealthVariantId], references: [id], onDelete: Restrict)
+
+  @@index([matchupId])
+  @@index([stealthVariantId, processedAt])
+}
+
+model ArenaShownJob {
+  id          String    @id @default(cuid())
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  modelId String
+  model   Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  count Int @default(1)
+
+  @@index([modelId])
+}
+
+model ArenaCoverageModelPrompt {
+  modelId String
+  promptId String
+  decisiveVotes Int @default(0)
+
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  @@id([modelId, promptId])
+  @@index([promptId])
+}
+
+model ArenaCoveragePair {
+  modelLowId String
+  modelHighId String
+  decisiveVotes Int @default(0)
+
+  modelLow Model @relation("ArenaCoveragePairLow", fields: [modelLowId], references: [id], onDelete: Cascade)
+  modelHigh Model @relation("ArenaCoveragePairHigh", fields: [modelHighId], references: [id], onDelete: Cascade)
+
+  @@id([modelLowId, modelHighId])
+}
+
+model ArenaCoveragePairPrompt {
+  modelLowId String
+  modelHighId String
+  promptId String
+  decisiveVotes Int @default(0)
+
+  modelLow Model @relation("ArenaCoveragePairPromptLow", fields: [modelLowId], references: [id], onDelete: Cascade)
+  modelHigh Model @relation("ArenaCoveragePairPromptHigh", fields: [modelHighId], references: [id], onDelete: Cascade)
+  prompt Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+
+  @@id([modelLowId, modelHighId, promptId])
+  @@index([promptId])
+}
+
+model CustomBuild {
+  id          String   @id @default(cuid())
+  publicId    String   @unique
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  startedAt   DateTime?
+  completedAt DateTime?
+  removedAt   DateTime?
+  purgeAt     DateTime?
+  objectsDeletedAt DateTime?
+  deletionPendingAt DateTime?
+  deletionError String?
+
+  ownerId String? @db.Uuid
+  owner   User?   @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+
+  status       CustomBuildStatus @default(queued)
+  currentStage String?
+  progress     Json?
+
+  promptText     String
+  promptSha256   String
+  gridSize       Int
+  palette        String
+  mode           String @default("precise")
+  generationMode String @default("tool")
+
+  modelKind         String
+  modelKey          String?
+  modelProvider     String
+  modelId           String
+  modelDisplayName  String
+  openRouterModelId String?
+  legacyCustomBaseUrl String? @map("customBaseUrl") @ignore
+  preferOpenRouter  Boolean @default(false)
+  usesHostedGeneration Boolean @default(false)
+  reasoning         String?
+
+  blockCount       Int?
+  generationTimeMs Int?
+  warnings         Json?
+  metrics          Json?
+
+  buildSha256             String?
+  buildByteSize           Int?
+  buildCompressedByteSize Int?
+  previewBlockCount       Int?
+  previewSha256           String?
+  storedByteSize          Int @default(0)
+
+  errorCode      String?
+  errorMessage   String?
+  errorRetryable Boolean?
+
+  requestedIpHash        String?
+  requestedUserAgentHash String?
+
+  jobs      CustomBuildJob[]
+  artifacts CustomBuildArtifact[]
+  events    CustomBuildEvent[]
+  secret    CustomBuildSecret?
+  galleryExamples GalleryExample[]
+
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@index([ownerId, removedAt, status, createdAt])
+  @@index([ownerId, deletionPendingAt])
+  @@index([promptSha256])
+  @@index([modelProvider, modelId])
+}
+
+model CustomBuildSecret {
+  id            String @id @default(cuid())
+  customBuildId String @unique
+  customBuild   CustomBuild @relation(fields: [customBuildId], references: [id], onDelete: Cascade)
+
+  provider      String
+  keyCiphertext String
+  keyIv         String
+  keyAuthTag    String?
+  endpointCiphertext String?
+  endpointIv String?
+  endpointAuthTag String?
+  keyVersion    Int @default(1)
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  deletedAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+model CustomBuildJob {
+  id            String @id @default(cuid())
+  customBuildId String
+  customBuild   CustomBuild @relation(fields: [customBuildId], references: [id], onDelete: Cascade)
+
+  type     CustomBuildJobType
+  status   CustomBuildJobStatus @default(queued)
+  payload  Json?
+  priority Int @default(0)
+
+  attempts    Int @default(0)
+  maxAttempts Int @default(3)
+  runAfter    DateTime @default(now())
+
+  lockedBy       String?
+  lockedAt       DateTime?
+  leaseExpiresAt DateTime?
+
+  startedAt        DateTime?
+  completedAt      DateTime?
+  lastErrorCode    String?
+  lastErrorMessage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, runAfter, priority, createdAt])
+  @@index([leaseExpiresAt])
+  @@index([customBuildId, type, status])
+}
+
+model CustomBuildArtifact {
+  id            String @id @default(cuid())
+  customBuildId String
+  customBuild   CustomBuild @relation(fields: [customBuildId], references: [id], onDelete: Cascade)
+
+  kind        CustomBuildArtifactKind
+  format      String
+  bucket      String
+  path        String
+  encoding    CustomBuildStorageEncoding @default(identity)
+  contentType String
+  fileName    String
+
+  sha256             String
+  sourceBuildSha256  String?
+  byteSize           Int
+  compressedByteSize Int?
+  storedByteSize     Int
+  blockCount         Int?
+  exportStats        Json?
+
+  createdAt DateTime @default(now())
+
+  @@unique([customBuildId, kind, sourceBuildSha256])
+  @@index([customBuildId, kind])
+  @@index([sha256])
+}
+
+model CustomBuildEvent {
+  id            String @id @default(cuid())
+  customBuildId String
+  customBuild   CustomBuild @relation(fields: [customBuildId], references: [id], onDelete: Cascade)
+
+  seq       Int
+  type      String
+  data      Json?
+  createdAt DateTime @default(now())
+
+  @@unique([customBuildId, seq])
+  @@index([customBuildId, createdAt])
+}
+
+model CustomBuildStatsDaily {
+  day              DateTime @id
+  created          Int @default(0)
+  succeeded        Int @default(0)
+  failed           Int @default(0)
+  canceled         Int @default(0)
+  exportsRequested Int @default(0)
+  exportsSucceeded Int @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+enum GalleryModerationKind {
+  REPORT
+  FILTER_REJECTION
+  APPEAL
+  ADMIN_ACTION
+}
+
+enum GalleryModerationTarget {
+  CANDIDATE
+  EXAMPLE
+  ACCOUNT
+  VOTE_BLOCK
+}
+
+enum GalleryReportReason {
+  OFFENSIVE
+  SPAM
+  MISLEADING
+  OTHER
+}
+
+model GalleryCandidate {
+  id              String   @id @default(cuid())
+  publicId        String   @unique
+  promptText      String
+  promptKey       String   @unique
+  uploaderId      String   @db.Uuid
+  postAnonymously Boolean  @default(false)
+  upvoteCount     Int      @default(0)
+  publishedAt     DateTime @default(now())
+  selectedAt      DateTime?
+  selectedById    String?  @db.Uuid
+  officialPromptId String? @unique
+  removedAt       DateTime?
+  adminHiddenAt   DateTime?
+  purgeAt         DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  uploader       User       @relation("GalleryCandidateUploader", fields: [uploaderId], references: [id], onDelete: Restrict)
+  selectedBy     User?      @relation("GalleryCandidateSelector", fields: [selectedById], references: [id], onDelete: SetNull)
+  officialPrompt Prompt?    @relation(fields: [officialPromptId], references: [id], onDelete: SetNull)
+  examples       GalleryExample[]
+  votes          GalleryVote[]
+  moderationRecords GalleryModerationRecord[]
+
+  @@index([adminHiddenAt, removedAt, upvoteCount, publishedAt, id], map: "GalleryCandidate_adminHiddenAt_removedAt_upvoteCount_publis_idx")
+  @@index([adminHiddenAt, removedAt, publishedAt, id])
+  @@index([uploaderId, removedAt, publishedAt])
+  @@index([selectedById])
+}
+
+model GalleryExample {
+  id              String   @id @default(cuid())
+  candidateId     String
+  customBuildId   String
+  contributorId   String   @db.Uuid
+  postAnonymously Boolean  @default(false)
+  removedAt       DateTime?
+  adminHiddenAt   DateTime?
+  purgeAt         DateTime?
+  previewRetained Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  candidate   GalleryCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  customBuild CustomBuild      @relation(fields: [customBuildId], references: [id], onDelete: Restrict)
+  contributor User             @relation("GalleryExampleContributor", fields: [contributorId], references: [id], onDelete: Restrict)
+  moderationRecords GalleryModerationRecord[]
+
+  @@unique([candidateId, customBuildId])
+  @@index([candidateId, adminHiddenAt, removedAt, createdAt], map: "GalleryExample_candidateId_adminHiddenAt_removedAt_createdA_idx")
+  @@index([contributorId, removedAt, createdAt])
+  @@index([customBuildId])
+}
+
+model GalleryVote {
+  id          String   @id @default(cuid())
+  candidateId String
+  sessionId   String
+  userId      String?  @db.Uuid
+  createdAt   DateTime @default(now())
+
+  candidate GalleryCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  user      User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([candidateId, sessionId])
+  @@unique([candidateId, userId])
+  @@index([sessionId])
+  @@index([userId, createdAt])
+}
+
+model GalleryModerationRecord {
+  id            String                  @id @default(cuid())
+  kind          GalleryModerationKind
+  target        GalleryModerationTarget
+  action        String?
+  reportReason  GalleryReportReason?
+  note          String?
+  safeSnapshot  Json?
+  actorUserId   String?                 @db.Uuid
+  subjectUserId String?                 @db.Uuid
+  candidateId   String?
+  exampleId     String?
+  sessionHash   String?
+  ipHmac        String?
+  createdAt     DateTime                @default(now())
+  purgeAt       DateTime?
+
+  actor     User?             @relation("GalleryModerationActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  subject   User?             @relation("GalleryModerationSubject", fields: [subjectUserId], references: [id], onDelete: SetNull)
+  candidate GalleryCandidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  example   GalleryExample?   @relation(fields: [exampleId], references: [id], onDelete: SetNull)
+
+  @@index([kind, createdAt])
+  @@index([purgeAt, createdAt])
+  @@index([candidateId])
+  @@index([exampleId])
+  @@index([actorUserId])
+  @@index([subjectUserId])
+}
+
+model GalleryVoteBlock {
+  id           String    @id @default(cuid())
+  userId       String?   @db.Uuid
+  sessionHash  String?
+  ipHmac       String?
+  createdById  String    @db.Uuid
+  reversedById String?   @db.Uuid
+  internalNote String?
+  createdAt    DateTime  @default(now())
+  reversedAt   DateTime?
+
+  user       User? @relation("GalleryVoteBlockSubject", fields: [userId], references: [id], onDelete: SetNull)
+  createdBy  User  @relation("GalleryVoteBlockCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  reversedBy User? @relation("GalleryVoteBlockReverser", fields: [reversedById], references: [id], onDelete: SetNull)
+
+  @@index([userId, reversedAt])
+  @@index([sessionHash, reversedAt])
+  @@index([ipHmac, reversedAt])
+  @@index([createdById, createdAt])
+  @@index([reversedById])
+}
+
+model PublicSessionActivity {
+  id            String   @id @default(cuid())
+  sessionId     String   @unique
+  userId        String?  @db.Uuid
+  lastSeenAt    DateTime @default(now())
+  city          String?  @db.VarChar(160)
+  countryRegion String?  @db.VarChar(64)
+  country       String?  @db.VarChar(8)
+  ipHmac        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([lastSeenAt])
+  @@index([userId, lastSeenAt])
+  @@index([ipHmac, lastSeenAt])
+}

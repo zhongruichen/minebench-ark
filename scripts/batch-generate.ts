@@ -1,0 +1,1217 @@
+#!/usr/bin/env -S tsx
+/**
+ * Batch Generate & Upload Script for MineBench
+ * 
+ * Usage:
+ *   pnpm batch:generate                     # Show status of all builds
+ *   pnpm batch:generate --upload            # Upload existing builds to prod
+ *   pnpm batch:generate --generate          # Generate missing builds
+ *   pnpm batch:generate --generate --upload # Generate missing and upload all
+ *   pnpm batch:generate --generate --openrouter # Force OpenRouter routing where available
+ *   pnpm batch:generate --generate --notools # Generate missing builds without voxel.exec tool usage
+ *   pnpm batch:generate --generate --no-tools # Alias for --notools
+ *   pnpm batch:generate --generate --model gpt-5-4-mini --reasoning high
+ *   pnpm batch:generate --prompt "castle"   # Filter by single prompt
+ *   pnpm batch:generate --prompt skyscraper castle fighter-jet --generate # Multiple prompts
+ *   pnpm batch:generate --model gemini      # Filter by single model
+ *   pnpm batch:generate --model gemini-pro gemini-flash --generate # Multiple models
+ *   pnpm batch:generate --prompt astronaut --promptText "An astronaut in a space suit" # Custom prompt text override
+ * 
+ * Environment:
+ *   Requires .env with API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.) or OPENROUTER_API_KEY
+ *   For upload: requires ADMIN_TOKEN
+ *   For large upload path (recommended): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_BUCKET (optional)
+ */
+
+import * as fs from "fs";
+import * as path from "path";
+import { createHash } from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
+import { generateVoxelBuild } from "../lib/ai/generateVoxelBuild";
+import { maxBlocksForGrid } from "../lib/ai/limits";
+import { extractBestVoxelBuildJson } from "../lib/ai/jsonExtract";
+import { MODEL_CATALOG, ModelKey } from "../lib/ai/modelCatalog";
+import { getPalette } from "../lib/blocks/palettes";
+import {
+  BENCHMARK_PROMPT_MAP,
+  MODEL_SLUG,
+  PROMPT_MAP,
+  listUploadPromptSlugs,
+  readUploadPromptText,
+} from "./uploadsCatalog";
+import {
+  BenchmarkMetricsStore,
+  createBenchmarkRunConfiguration,
+  isMissingBenchmarkArtifact,
+  type BenchmarkModelSummary,
+} from "./benchmarkMetrics";
+import { validateVoxelBuild } from "../lib/voxel/validate";
+
+// load env
+import "dotenv/config";
+
+const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+// Import target. Defaults to production; publication and the staging wrapper
+// point this at the deployment they verified against.
+const SITE_URL = (process.env.MINEBENCH_SITE_URL ?? "https://minebench.ai").replace(/\/+$/, "");
+
+// Preview deployments sit behind Vercel deployment protection, so scripted imports
+// need the automation bypass secret. Production ignores it.
+function protectionBypassHeaders(): Record<string, string> {
+  const secret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET?.trim();
+  return secret ? { "x-vercel-protection-bypass": secret } : {};
+}
+const DEFAULT_STORAGE_BUCKET = "builds";
+const DEFAULT_STORAGE_PREFIX = "imports";
+
+interface Job {
+  promptSlug: string;
+  promptText: string | null;
+  modelKey: ModelKey;
+  modelSlug: string;
+  filePath: string;
+}
+
+function jobLabel(job: Job): string {
+  return `${job.promptSlug} × ${job.modelSlug}`;
+}
+
+type StorageUploadConfig = {
+  url: string;
+  serviceRoleKey: string;
+  bucket: string;
+  prefix: string;
+};
+
+type BuildStorageReference = {
+  bucket: string;
+  path: string;
+  encoding: "gzip";
+  byteSize: number;
+  compressedByteSize: number;
+  sha256: string;
+  blockCount: number;
+};
+
+type PreparedUploadPayload = {
+  jsonBytes: Buffer<ArrayBufferLike>;
+  gzipped: Buffer<ArrayBufferLike>;
+  sha256: string;
+  blockCount: number;
+};
+
+function getJsonPath(promptSlug: string, modelSlug: string): string {
+  return path.join(UPLOADS_DIR, promptSlug, `${promptSlug}-${modelSlug}.json`);
+}
+
+type RawResponseJob = Pick<Job, "promptSlug" | "modelSlug">;
+
+type RawResponseWriteOptions = {
+  attempt?: number;
+  uploadsDir?: string;
+};
+
+function getRawDir(promptSlug: string, uploadsDir = UPLOADS_DIR): string {
+  return path.join(uploadsDir, promptSlug, "RAW");
+}
+
+function getRawResponsePath(
+  job: RawResponseJob,
+  ext: "json" | "txt",
+  options: RawResponseWriteOptions = {},
+): string {
+  const attemptSuffix =
+    options.attempt === undefined
+      ? ""
+      : `-attempt-${String(options.attempt).padStart(2, "0")}`;
+  return path.join(
+    getRawDir(job.promptSlug, options.uploadsDir),
+    `${job.promptSlug}-${job.modelSlug}-RAW${attemptSuffix}.${ext}`,
+  );
+}
+
+export function writeRawResponse(
+  job: RawResponseJob,
+  rawText: string,
+  options: RawResponseWriteOptions = {},
+): { filePath: string; isJson: boolean } {
+  const rawDir = getRawDir(job.promptSlug, options.uploadsDir);
+  ensureDir(rawDir);
+
+  let isJson = false;
+  try {
+    JSON.parse(rawText);
+    isJson = true;
+  } catch {
+    isJson = false;
+  }
+
+  const nextPath = getRawResponsePath(job, isJson ? "json" : "txt", options);
+  const stalePath = getRawResponsePath(job, isJson ? "txt" : "json", options);
+  fs.writeFileSync(nextPath, rawText);
+  if (fs.existsSync(stalePath)) {
+    fs.unlinkSync(stalePath);
+  }
+
+  return { filePath: nextPath, isJson };
+}
+
+export function clearRawAttemptResponses(
+  job: RawResponseJob,
+  uploadsDir = UPLOADS_DIR,
+): void {
+  const rawDir = getRawDir(job.promptSlug, uploadsDir);
+  if (!fs.existsSync(rawDir)) return;
+
+  const prefix = `${job.promptSlug}-${job.modelSlug}-RAW-attempt-`;
+  for (const name of fs.readdirSync(rawDir)) {
+    const suffix = name.startsWith(prefix) ? name.slice(prefix.length) : "";
+    if (/^\d+\.(?:json|txt)$/.test(suffix)) {
+      fs.unlinkSync(path.join(rawDir, name));
+    }
+  }
+}
+
+function trimTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function encodeStoragePath(pathValue: string): string {
+  return pathValue
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function getStorageUploadConfig(): StorageUploadConfig | null {
+  const url = (process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").trim();
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
+  if (!url || !serviceRoleKey) return null;
+
+  const bucket = (process.env.SUPABASE_STORAGE_BUCKET ?? DEFAULT_STORAGE_BUCKET).trim() || DEFAULT_STORAGE_BUCKET;
+  const prefix = (process.env.SUPABASE_STORAGE_PREFIX ?? DEFAULT_STORAGE_PREFIX).trim() || DEFAULT_STORAGE_PREFIX;
+  return {
+    url: trimTrailingSlashes(url),
+    serviceRoleKey,
+    bucket,
+    prefix: prefix.replace(/^\/+|\/+$/g, ""),
+  };
+}
+
+function buildStoragePath(job: Job): string {
+  return `${job.promptSlug}/${job.modelSlug}-g256-simple-precise.json.gz`;
+}
+
+function parseLocalBuildJson(jsonBytes: Buffer<ArrayBufferLike>): unknown | null {
+  const text = jsonBytes.toString("utf-8");
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return extractBestVoxelBuildJson(text);
+  }
+}
+
+function prepareUploadPayload(job: Job): { ok: true; prepared: PreparedUploadPayload } | { ok: false; error: string } {
+  const jsonBytes = fs.readFileSync(job.filePath);
+  const payload = parseLocalBuildJson(jsonBytes);
+  if (!payload) {
+    return { ok: false, error: "Build file does not contain a valid JSON object" };
+  }
+
+  const validated = validateVoxelBuild(payload, {
+    gridSize: 256,
+    palette: getPalette("simple"),
+    maxBlocks: maxBlocksForGrid(256),
+  });
+  if (!validated.ok) {
+    return { ok: false, error: validated.error };
+  }
+
+  const gzipped = gzipSync(jsonBytes);
+  return {
+    ok: true,
+    prepared: {
+      jsonBytes,
+      gzipped,
+      sha256: createHash("sha256").update(jsonBytes).digest("hex"),
+      blockCount: validated.value.build.blocks.length,
+    },
+  };
+}
+
+function collectFlagValues(args: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== flag) continue;
+    let j = i + 1;
+    while (j < args.length && !args[j].startsWith("--")) {
+      values.push(args[j]);
+      j += 1;
+    }
+    i = j - 1;
+  }
+  return values;
+}
+
+function buildPromptFilterMatcher(promptSlugs: string[], promptFilters: string[]): (promptSlug: string) => boolean {
+  const normalizedPromptFilters = promptFilters.map((f) => f.trim().toLowerCase()).filter(Boolean);
+  if (normalizedPromptFilters.length === 0) {
+    return () => true;
+  }
+
+  const knownPromptSlugs = new Set(promptSlugs.map((slug) => slug.toLowerCase()));
+  const exactPromptFilters = new Set(normalizedPromptFilters.filter((f) => knownPromptSlugs.has(f)));
+
+  return (promptSlug: string) => {
+    const slugLower = promptSlug.toLowerCase();
+    return normalizedPromptFilters.some((f) => {
+      if (exactPromptFilters.has(f)) return f === slugLower;
+      return slugLower.includes(f);
+    });
+  };
+}
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const reasoning = args.find((a, i) => args[i - 1] === "--reasoning") || null;
+  const attemptsRaw = args.find((a, i) => args[i - 1] === "--attempts") || null;
+  const attemptsNum = attemptsRaw ? Number(attemptsRaw) : NaN;
+  const attempts = Number.isFinite(attemptsNum) ? Math.max(1, Math.floor(attemptsNum)) : 6;
+  const concurrencyRaw = args.find((a, i) => args[i - 1] === "--concurrency") || null;
+  const concurrencyNum = concurrencyRaw ? Number(concurrencyRaw) : NaN;
+  const concurrency = Number.isFinite(concurrencyNum) ? Math.max(1, Math.floor(concurrencyNum)) : 1;
+
+  // collect all values after --prompt / --model until next flag; supports repeated flags
+  const promptFilters = collectFlagValues(args, "--prompt");
+  const modelFilters = collectFlagValues(args, "--model");
+
+  return {
+    generate: args.includes("--generate"),
+    upload: args.includes("--upload"),
+    openrouter: args.includes("--openrouter"),
+    overwrite: args.includes("--overwrite"),
+    notools: args.includes("--notools") || args.includes("--no-tools"),
+    reasoning,
+    attempts,
+    concurrency,
+    promptFilters,
+    modelFilters,
+    promptText: args.find((a, i) => args[i - 1] === "--promptText") || null,
+    promptTextFile: args.find((a, i) => args[i - 1] === "--promptTextFile") || null,
+    help: args.includes("--help") || args.includes("-h"),
+  };
+}
+
+function ensureDir(dir: string) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function getDefaultCandidateModels(): ModelKey[] {
+  return MODEL_CATALOG.filter((m) => m.enabled || m.importOnly).map((m) => m.key);
+}
+
+export function getCandidateModels(modelFilters: string[]): ModelKey[] {
+  // If the user is explicitly filtering by model, include disabled models too so
+  // existing builds (e.g. benchmark-only models) can be uploaded/status-checked.
+  // Generation will still be gated elsewhere unless the user explicitly requests it.
+  if (modelFilters.length > 0) return MODEL_CATALOG.map((m) => m.key);
+  return getDefaultCandidateModels();
+}
+
+function getModel(modelKey: ModelKey) {
+  return MODEL_CATALOG.find((model) => model.key === modelKey);
+}
+
+function exactImportOnlyModelKeys(modelFilters: string[]): Set<ModelKey> {
+  const normalizedFilters = modelFilters.map((filter) => filter.trim().toLowerCase()).filter(Boolean);
+  return new Set(
+    MODEL_CATALOG
+      .filter((model) => model.importOnly)
+      .flatMap((model) => {
+        const slug = MODEL_SLUG[model.key].toLowerCase();
+        const key = model.key.toLowerCase();
+        return normalizedFilters.includes(slug) || normalizedFilters.includes(key) ? [model.key] : [];
+      }),
+  );
+}
+
+export function getJobsToGenerate<T extends Pick<Job, "modelKey">>(opts: {
+  generate: boolean;
+  overwrite: boolean;
+  modelFilters: string[];
+  allJobs: T[];
+  missingJobs: T[];
+}): T[] {
+  if (!opts.generate) return [];
+  const candidates = opts.overwrite ? opts.allJobs : opts.missingJobs;
+  const explicitImportOnlyModels = exactImportOnlyModelKeys(opts.modelFilters);
+  return candidates.filter((job) => {
+    const model = getModel(job.modelKey);
+    if (!model?.importOnly) return true;
+    return explicitImportOnlyModels.has(job.modelKey);
+  });
+}
+
+function getModelsMissingOpenRouterForGenerationJobs(jobsToGenerate: Array<Pick<Job, "modelKey">>): string[] {
+  const modelKeys = new Set(jobsToGenerate.map((job) => job.modelKey));
+  return MODEL_CATALOG
+    .filter((model) => modelKeys.has(model.key) && !model.openRouterModelId)
+    .map((model) => `${model.key} (${model.displayName})`);
+}
+
+function getAllPromptSlugs(): string[] {
+  const slugs = new Set<string>(Object.keys(PROMPT_MAP));
+  for (const slug of listUploadPromptSlugs()) slugs.add(slug);
+  return Array.from(slugs).sort();
+}
+
+export function getBenchmarkPromptSlugs(): string[] {
+  return Object.keys(BENCHMARK_PROMPT_MAP).sort();
+}
+
+function resolvePromptText(promptSlug: string): string | null {
+  const fromCatalog = PROMPT_MAP[promptSlug];
+  if (fromCatalog) return fromCatalog;
+  const fromUploads = readUploadPromptText(promptSlug);
+  if (fromUploads) return fromUploads;
+  return null;
+}
+
+function buildJobList(
+  promptSlugs: string[],
+  promptTextBySlug: Map<string, string | null>,
+  promptFilters: string[],
+  modelFilters: string[]
+): Job[] {
+  const jobs: Job[] = [];
+  const models = getCandidateModels(modelFilters);
+  const promptMatches = buildPromptFilterMatcher(promptSlugs, promptFilters);
+  const missingModelSlugs = models.filter((k) => !MODEL_SLUG[k]);
+  if (missingModelSlugs.length > 0) {
+    throw new Error(`Missing MODEL_SLUG entries for model keys: ${missingModelSlugs.join(", ")}`);
+  }
+
+  const normalizedModelFilters = modelFilters.map((f) => f.trim().toLowerCase()).filter(Boolean);
+  const knownModelSlugs = new Set(models.map((k) => MODEL_SLUG[k].toLowerCase()));
+  const knownModelKeys = new Set(models.map((k) => k.toLowerCase()));
+  const exactModelFilters = new Set(
+    normalizedModelFilters.filter((f) => knownModelSlugs.has(f) || knownModelKeys.has(f))
+  );
+
+  for (const promptSlug of promptSlugs) {
+    if (!promptMatches(promptSlug)) continue;
+    const promptText = promptTextBySlug.get(promptSlug) ?? null;
+
+    for (const modelKey of models) {
+      const modelSlug = MODEL_SLUG[modelKey];
+      // if model filters provided, check if this model matches any of them
+      if (normalizedModelFilters.length > 0) {
+        const slugLower = modelSlug.toLowerCase();
+        const keyLower = modelKey.toLowerCase();
+
+        const matchesAny = normalizedModelFilters.some((f) => {
+          // If the user provided an exact model slug/key (matching any known model),
+          // treat it as an exact match. This avoids cases like "gpt-5-2" also matching "gpt-5-2-pro".
+          if (exactModelFilters.has(f)) return f === slugLower || f === keyLower;
+          return slugLower.includes(f) || keyLower.includes(f);
+        });
+        if (!matchesAny) continue;
+      }
+
+      const filePath = getJsonPath(promptSlug, modelSlug);
+      jobs.push({ promptSlug, promptText, modelKey, modelSlug, filePath });
+    }
+  }
+
+  return jobs;
+}
+
+export function isEmptyPlaceholder(filePath: string): boolean {
+  return isMissingBenchmarkArtifact(filePath);
+}
+
+function getMissingJobs(jobs: Job[]): Job[] {
+  return jobs.filter((j) => isEmptyPlaceholder(j.filePath));
+}
+
+export function getImportOnlyModelsForGenerationJobs(
+  jobsToGenerate: Array<Pick<Job, "modelKey">>,
+) {
+  const modelKeys = new Set(jobsToGenerate.map((job) => job.modelKey));
+  return MODEL_CATALOG.filter((model) => modelKeys.has(model.key) && model.importOnly);
+}
+
+async function generateAndSave(
+  job: Job,
+  attempts: number,
+  enableTools: boolean,
+  preferOpenRouter: boolean,
+  reasoning: string | null,
+  metricsStore: BenchmarkMetricsStore,
+  signal: AbortSignal,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  blockCount?: number;
+  generationTimeMs?: number;
+  jsonBytes?: number;
+  attemptCount?: number;
+}> {
+
+  if (!job.promptText) {
+    const error = `Missing prompt text for "${job.promptSlug}". Add uploads/${job.promptSlug}/prompt.txt or pass --promptText/--promptTextFile.`;
+    metricsStore.markFailed(job, error, 0);
+    return { ok: false, error, generationTimeMs: 0, attemptCount: 0 };
+  }
+
+  const label = jobLabel(job);
+  let attemptCount = 1;
+  clearRawAttemptResponses(job);
+  const result = await generateVoxelBuild({
+    modelKey: job.modelKey,
+    prompt: job.promptText,
+    gridSize: 256,
+    palette: "simple",
+    maxAttempts: attempts,
+    enableTools,
+    preferOpenRouter,
+    reasoning: reasoning ?? undefined,
+    abortSignal: signal,
+    onProviderRequest: (attempt) => {
+      // Persist every outbound generation request, including provider fallbacks
+      metricsStore.markProviderCall(job, attempt);
+    },
+    onRetry: (attempt, reason) => {
+      attemptCount = Math.max(attemptCount, attempt);
+      metricsStore.markRetry(job, attempt);
+      const msg = (reason ?? "").trim();
+      if (!msg) return;
+      console.log(`    ↻ [${label}] retry ${attempt}: ${msg}`);
+    },
+    onRawResponse: (attempt, rawText) => {
+      // A returned response counts even when parsing, validation, or voxel execution rejects it
+      try {
+        metricsStore.markCompletedAttempt(job, attempt);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `    ⚠️  [${label}] Could not track completed attempt ${attempt}: ${message}`,
+        );
+      }
+      try {
+        const raw = writeRawResponse(job, rawText, { attempt });
+        const relativePath = path.relative(process.cwd(), raw.filePath);
+        console.log(
+          `    💾 [${label}] Saved raw attempt ${attempt}: ${relativePath}`,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `    ⚠️  [${label}] Could not save raw attempt ${attempt}: ${message}`,
+        );
+      }
+    },
+    onProviderTrace: (message) => {
+      const msg = message.trim();
+      if (!msg) return;
+      console.log(`    ℹ️  [${label}] ${msg}`);
+    },
+  });
+
+  if (result.rawText) {
+    writeRawResponse(job, result.rawText);
+  }
+
+  if (!result.ok) {
+    if (result.rawText) {
+      const extracted = extractBestVoxelBuildJson(result.rawText);
+      if (extracted) {
+        const failedJsonPath = job.filePath.endsWith(".json")
+          ? job.filePath.replace(/\.json$/, ".failed.json")
+          : `${job.filePath}.failed.json`;
+        fs.writeFileSync(failedJsonPath, JSON.stringify(extracted, null, 2));
+      }
+    }
+    if (!signal.aborted) {
+      metricsStore.markFailed(job, result.error, result.generationTimeMs);
+    }
+    return {
+      ok: false,
+      error: result.error,
+      generationTimeMs: result.generationTimeMs,
+      attemptCount,
+    };
+  }
+
+  const serializedBuild = JSON.stringify(result.build, null, 2);
+  const sample = metricsStore.finalizeSuccess(job, serializedBuild, {
+    inferenceTimeMs: result.generationTimeMs,
+    attemptCount,
+    acceptedOutputTokens: result.acceptedOutputTokens,
+    configuration:
+      result.providerRoute && job.promptText
+        ? createBenchmarkRunConfiguration({
+            promptText: job.promptText,
+            providerRoute: result.providerRoute,
+            reasoningOverride: reasoning,
+            requestConfiguration: result.requestConfiguration,
+            acceptedConfiguration: result.acceptedRequestConfiguration,
+            toolsEnabled: enableTools,
+          })
+        : undefined,
+  });
+  const failedJsonPath = job.filePath.endsWith(".json")
+    ? job.filePath.replace(/\.json$/, ".failed.json")
+    : `${job.filePath}.failed.json`;
+  if (fs.existsSync(failedJsonPath)) fs.unlinkSync(failedJsonPath);
+
+  return {
+    ok: true,
+    blockCount: result.blockCount,
+    generationTimeMs: result.generationTimeMs,
+    jsonBytes: sample.jsonBytes,
+    attemptCount,
+  };
+}
+
+function getUploadCommand(job: Job): string {
+  if (!job.promptText) {
+    return `# Missing prompt text for "${job.promptSlug}". Add uploads/${job.promptSlug}/prompt.txt or pass --promptText/--promptTextFile.`;
+  }
+  return `pnpm batch:generate --upload --prompt ${job.promptSlug} --model ${job.modelSlug}`;
+}
+
+export function getAdminImportHeaders(token: string): Record<string, string> {
+  const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET?.trim();
+  return {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    ...(bypass ? { "x-vercel-protection-bypass": bypass } : {}),
+  };
+}
+
+function supportsTerminalHyperlinks(): boolean {
+  if (!process.stdout.isTTY) return false;
+  if ((process.env.TERM ?? "").toLowerCase() === "dumb") return false;
+  if (process.env.CI) return false;
+  return true;
+}
+
+function formatFileLink(filePath: string): { displayPath: string; absoluteUrl: string } {
+  const displayPath = path.relative(process.cwd(), filePath);
+  const absoluteUrl = pathToFileURL(path.resolve(filePath)).toString();
+  if (!supportsTerminalHyperlinks()) {
+    return { displayPath, absoluteUrl };
+  }
+
+  // OSC 8 hyperlink: works in iTerm2, Terminal.app, VS Code terminal, and many others.
+  const hyperlink = `\u001B]8;;${absoluteUrl}\u0007${displayPath}\u001B]8;;\u0007`;
+  return { displayPath: hyperlink, absoluteUrl };
+}
+
+async function uploadBuildLegacy(
+  job: Job,
+  token: string,
+  jsonBytes: Buffer<ArrayBufferLike>,
+  gzipped: Buffer<ArrayBufferLike>,
+  generationTimeMs?: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const url = new URL(`${SITE_URL}/api/admin/import-build`);
+  url.searchParams.set("modelKey", job.modelKey);
+  url.searchParams.set("promptText", job.promptText as string);
+  url.searchParams.set("overwrite", "1");
+  if (generationTimeMs !== undefined) {
+    url.searchParams.set("generationTimeMs", String(generationTimeMs));
+  }
+
+  async function doUpload(opts: { body: Uint8Array<ArrayBufferLike>; headers: Record<string, string> }) {
+    // Next's `fetch` typings only accept non-shared `ArrayBuffer` views, so coerce the buffer type
+    // without copying (Node Buffers use ArrayBuffer under the hood).
+    const body = new Uint8Array(opts.body.buffer as ArrayBuffer, opts.body.byteOffset, opts.body.byteLength);
+    const resp = await fetch(url.toString(), {
+      method: "POST",
+      headers: opts.headers,
+      body,
+    });
+    const text = await resp.text();
+    return { ok: resp.ok, status: resp.status, text };
+  }
+
+  const baseHeaders = getAdminImportHeaders(token);
+
+  const gzipAttempt = await doUpload({
+    headers: { ...baseHeaders, "Content-Encoding": "gzip" },
+    body: gzipped,
+  });
+
+  if (gzipAttempt.ok) return { ok: true };
+
+  // If prod hasn't been deployed with gzip support yet, it'll try to parse gzipped bytes as text,
+  // resulting in a "no JSON object found" error. Retry identity once to provide a clearer error.
+  const looksLikeGzipUnsupported =
+    gzipAttempt.status === 415 || (gzipAttempt.status === 400 && gzipAttempt.text.includes("Could not find a valid JSON object"));
+
+  if (looksLikeGzipUnsupported) {
+    const identityAttempt = await doUpload({ headers: baseHeaders, body: jsonBytes });
+    if (identityAttempt.ok) return { ok: true };
+    if (identityAttempt.status === 413) {
+      return {
+        ok: false,
+        error:
+          `HTTP 413: ${identityAttempt.text}\n\n` +
+          `Your client is sending gzip, but production doesn't appear to be decoding it yet. Deploy the updated ` +
+          `/api/admin/import-build route (gzip support) and retry.`,
+      };
+    }
+    return { ok: false, error: `HTTP ${identityAttempt.status}: ${identityAttempt.text}` };
+  }
+
+  return { ok: false, error: `HTTP ${gzipAttempt.status}: ${gzipAttempt.text}` };
+}
+
+async function uploadToSupabaseStorage(
+  job: Job,
+  prepared: PreparedUploadPayload,
+): Promise<{ ok: true; ref: BuildStorageReference } | { ok: false; error: string }> {
+  const storageConfig = getStorageUploadConfig();
+  if (!storageConfig) {
+    return {
+      ok: false,
+      error:
+        "SUPABASE storage config missing. Set SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY, and optionally SUPABASE_STORAGE_BUCKET.",
+    };
+  }
+
+  const objectPath = `${storageConfig.prefix}/${buildStoragePath(job)}`;
+  const encodedPath = encodeStoragePath(objectPath);
+  const url = `${storageConfig.url}/storage/v1/object/${encodeURIComponent(storageConfig.bucket)}/${encodedPath}`;
+  const body = new Uint8Array(prepared.gzipped.buffer as ArrayBuffer, prepared.gzipped.byteOffset, prepared.gzipped.byteLength);
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${storageConfig.serviceRoleKey}`,
+      apikey: storageConfig.serviceRoleKey,
+      "x-upsert": "true",
+      "Content-Type": "application/gzip",
+    },
+    body,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    return { ok: false, error: `Storage upload failed (HTTP ${resp.status}): ${text}` };
+  }
+
+  return {
+    ok: true,
+    ref: {
+      bucket: storageConfig.bucket,
+      path: objectPath,
+      encoding: "gzip",
+      byteSize: prepared.jsonBytes.byteLength,
+      compressedByteSize: prepared.gzipped.byteLength,
+      sha256: prepared.sha256,
+      blockCount: prepared.blockCount,
+    },
+  };
+}
+
+async function finalizeStorageImport(
+  job: Job,
+  token: string,
+  ref: BuildStorageReference,
+  generationTimeMs?: number,
+): Promise<{ ok: boolean; buildId?: string; error?: string }> {
+  const url = new URL(`${SITE_URL}/api/admin/import-build`);
+  url.searchParams.set("modelKey", job.modelKey);
+  url.searchParams.set("promptText", job.promptText as string);
+  url.searchParams.set("overwrite", "1");
+  if (generationTimeMs !== undefined) {
+    url.searchParams.set("generationTimeMs", String(generationTimeMs));
+  }
+
+  const resp = await fetch(url.toString(), {
+    method: "POST",
+    headers: getAdminImportHeaders(token),
+    body: JSON.stringify({ storage: ref }),
+  });
+
+  const text = await resp.text();
+  if (resp.ok) {
+    // The response's buildId is held for this run only; it is environment
+    // state, not benchmark provenance, so it never enters the ledger
+    let buildId: string | undefined;
+    try {
+      const parsed = JSON.parse(text) as { buildId?: unknown };
+      if (typeof parsed.buildId === "string") buildId = parsed.buildId;
+    } catch {
+      // response body is informational; a missing id is not a failure
+    }
+    return { ok: true, buildId };
+  }
+  return { ok: false, error: `Finalize import failed (HTTP ${resp.status}): ${text}` };
+}
+
+async function uploadBuild(
+  job: Job,
+  generationTimeMs?: number,
+): Promise<{ ok: boolean; buildId?: string; error?: string }> {
+  if (!job.promptText) {
+    return { ok: false, error: `Missing prompt text for "${job.promptSlug}". Add uploads/${job.promptSlug}/prompt.txt or pass --promptText/--promptTextFile.` };
+  }
+
+  const token = process.env.ADMIN_TOKEN;
+  if (!token) {
+    return { ok: false, error: "ADMIN_TOKEN not set" };
+  }
+
+  const preparedUpload = prepareUploadPayload(job);
+  if (!preparedUpload.ok) {
+    return { ok: false, error: `Upload validation failed: ${preparedUpload.error}` };
+  }
+
+  const prepared = preparedUpload.prepared;
+
+  const storageAttempt = await uploadToSupabaseStorage(job, prepared);
+  if (storageAttempt.ok) {
+    return finalizeStorageImport(job, token, storageAttempt.ref, generationTimeMs);
+  }
+
+  const legacy = await uploadBuildLegacy(
+    job,
+    token,
+    prepared.jsonBytes,
+    prepared.gzipped,
+    generationTimeMs,
+  );
+  if (legacy.ok) return legacy;
+
+  return {
+    ok: false,
+    error:
+      `${storageAttempt.error}\n\n` +
+      `Legacy upload fallback also failed:\n${legacy.error}`,
+  };
+}
+
+function printStatus(jobs: Job[]) {
+  console.log("\n📊 Current Status by Prompt:\n");
+
+  const promptGroups = new Map<string, Job[]>();
+  for (const j of jobs) {
+    if (!promptGroups.has(j.promptSlug)) promptGroups.set(j.promptSlug, []);
+    promptGroups.get(j.promptSlug)!.push(j);
+  }
+
+  for (const [slug, group] of promptGroups) {
+    const hasPromptText = group.some((j) => Boolean(j.promptText));
+    const existing = group.filter((j) => !isEmptyPlaceholder(j.filePath));
+    const missing = group.filter((j) => isEmptyPlaceholder(j.filePath));
+
+    console.log(`  ${slug}: ${existing.length}/${group.length} models${hasPromptText ? "" : " (⚠️ missing prompt text)"}`);
+    if (existing.length > 0) {
+      console.log(`    ✅ ${existing.map((j) => j.modelSlug).join(", ")}`);
+    }
+    if (missing.length > 0) {
+      console.log(`    ❌ ${missing.map((j) => j.modelSlug).join(", ")}`);
+    }
+  }
+}
+
+function printUploadCommands(jobs: Job[]) {
+  console.log("\n📤 Upload Commands for Existing Builds:\n");
+  console.log("# Run these commands to upload all existing builds to production:\n");
+
+  for (const job of jobs) {
+    if (!isEmptyPlaceholder(job.filePath)) {
+      console.log(`# ${job.promptSlug} × ${job.modelSlug}`);
+      console.log(getUploadCommand(job));
+      console.log("");
+    }
+  }
+}
+
+export function buildBenchmarkMetricJobs(
+  modelKeys: ModelKey[],
+): Job[] {
+  return getBenchmarkPromptSlugs().flatMap((promptSlug) =>
+    modelKeys.map((modelKey) => {
+      const modelSlug = MODEL_SLUG[modelKey];
+      return {
+        promptSlug,
+        promptText: BENCHMARK_PROMPT_MAP[promptSlug],
+        modelKey,
+        modelSlug,
+        filePath: getJsonPath(promptSlug, modelSlug),
+      };
+    }),
+  );
+}
+
+function formatDuration(milliseconds: number | undefined): string {
+  if (milliseconds === undefined) return "Not tracked";
+  const totalSeconds = milliseconds / 1000;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds - minutes * 60;
+  const secondsLabel = Number.isInteger(seconds) ? seconds.toFixed(0) : seconds.toFixed(1);
+  return minutes > 0 ? `${minutes}m ${secondsLabel}s` : `${secondsLabel}s`;
+}
+
+function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined) return "Not tracked";
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+function printBenchmarkSummary(
+  summaries: Map<ModelKey, BenchmarkModelSummary>,
+): void {
+  if (summaries.size === 0) return;
+  console.log("\n📈 Benchmark metrics:\n");
+  for (const [modelKey, summary] of summaries) {
+    const model = getModel(modelKey);
+    console.log(`  ${model?.displayName ?? modelKey}`);
+    console.log(
+      `    Finalized builds: ${summary.finalizedBuildCount}/${summary.expectedBuildCount}`,
+    );
+    console.log(
+      `    Average inference time: ${formatDuration(summary.averageInferenceMs)} (${summary.inferenceSampleCount}/${summary.expectedBuildCount} tracked)`,
+    );
+    console.log(`    Average JSON size: ${formatBytes(summary.averageJsonSizeBytes)}`);
+    console.log(
+      `    Total attempts: ${summary.completedAttemptCount ?? "Not tracked"} (${summary.completedAttemptTrackingJobCount ?? 0}/${summary.expectedBuildCount} jobs tracked)`,
+    );
+    console.log(
+      `    Provider calls: ${summary.providerCallCount ?? "Not tracked"} (${summary.providerCallTrackingJobCount ?? 0}/${summary.expectedBuildCount} jobs tracked)`,
+    );
+    console.log(
+      `    Rejected responses: ${summary.rejectedResponseCount ?? "Not tracked"} · Failed attempts (includes rejected responses): ${summary.failedAttemptCount ?? "Not tracked"} · Failed runs: ${summary.failedCount} · Interrupted runs: ${summary.interruptedCount} · Running: ${summary.runningCount}`,
+    );
+    console.log("    Total cost: Manual");
+  }
+}
+
+async function main() {
+  const opts = parseArgs();
+
+  if (process.argv.slice(2).includes("--reasoning") && !opts.reasoning) {
+    console.error("\nError: --reasoning requires a value.\n");
+    process.exit(1);
+  }
+
+  if (opts.help) {
+    console.log(`
+MineBench Batch Generate Script
+
+Usage:
+  pnpm batch:generate                     # Show status of all builds
+  pnpm batch:generate --upload            # Upload existing builds to prod
+  pnpm batch:generate --generate          # Generate missing builds
+  pnpm batch:generate --generate --upload # Generate missing and upload all
+  pnpm batch:generate --generate --openrouter # Force OpenRouter routing where available
+  pnpm batch:generate --generate --overwrite # Regenerate even if JSON exists
+  pnpm batch:generate --generate --model gpt-5-4-mini --reasoning high
+  pnpm batch:generate --prompt castle     # Filter by single prompt
+  pnpm batch:generate --prompt skyscraper castle fighter-jet --generate # Multiple prompts
+  pnpm batch:generate --model gemini      # Filter by single model
+  pnpm batch:generate --model gemini-pro gemini-flash --generate  # Multiple models
+  pnpm batch:generate --prompt astronaut --promptText "An astronaut in a space suit"
+  pnpm batch:generate --generate --concurrency 4  # Run 4 generations at once
+
+Options:
+  --generate        Generate missing builds (off by default)
+  --upload          Upload builds to production
+  --openrouter      Prefer OpenRouter over native provider when both are available
+  --overwrite       When generating, overwrite existing JSON files
+  --notools         Disable voxel.exec tool usage (tools are on by default)
+  --no-tools        Alias for --notools
+  --reasoning <s>   Override model thinking/reasoning level when the selected route supports it
+  --attempts <n>    Max attempts per build (default 6)
+  --concurrency <n> Number of concurrent generations (default 1)
+  --prompt <str...> Filter prompts by slug (can specify multiple)
+  --model <str...>  Filter models by slug (can specify multiple)
+  --promptText <s>  Prompt text override (only when filtered to 1 prompt)
+  --promptTextFile <path> Prompt text override read from file (only when filtered to 1 prompt)
+  --help, -h        Show this help
+
+Upload notes:
+  - If SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY are present, uploads go to Supabase Storage first
+    and /api/admin/import-build receives a tiny finalize payload.
+  - If they are missing, script falls back to direct /api/admin/import-build body upload.
+    `);
+    return;
+  }
+
+  console.log("🏗️  MineBench Batch Generator\n");
+
+  // ensure base uploads dir exists
+  ensureDir(UPLOADS_DIR);
+
+  const promptSlugs = getAllPromptSlugs();
+  const promptTextBySlug = new Map<string, string | null>();
+  for (const slug of promptSlugs) promptTextBySlug.set(slug, resolvePromptText(slug));
+
+  const promptMatches = buildPromptFilterMatcher(promptSlugs, opts.promptFilters);
+  const filteredPromptSlugs = promptSlugs.filter((slug) => promptMatches(slug));
+
+  const promptTextOverride = opts.promptTextFile
+    ? (fs.existsSync(opts.promptTextFile) ? fs.readFileSync(opts.promptTextFile, "utf-8").trim() : "")
+    : (opts.promptText ?? "").trim();
+
+  if ((opts.promptText || opts.promptTextFile) && filteredPromptSlugs.length !== 1) {
+    console.error(
+      `\nError: --promptText/--promptTextFile requires filtering to exactly 1 prompt folder.\n` +
+        `Matched prompts: ${filteredPromptSlugs.length}\n`
+    );
+    process.exit(1);
+  }
+
+  if (promptTextOverride && filteredPromptSlugs.length === 1) {
+    promptTextBySlug.set(filteredPromptSlugs[0], promptTextOverride);
+  }
+
+  const allJobs = buildJobList(promptSlugs, promptTextBySlug, opts.promptFilters, opts.modelFilters);
+  const missing = getMissingJobs(allJobs);
+  const jobsToGenerate = getJobsToGenerate({
+    generate: opts.generate,
+    overwrite: opts.overwrite,
+    modelFilters: opts.modelFilters,
+    allJobs,
+    missingJobs: missing,
+  });
+  const selectedModelKeys = Array.from(new Set(allJobs.map((j) => j.modelKey)));
+  const metricJobs = buildBenchmarkMetricJobs(selectedModelKeys);
+  const metricsStore = new BenchmarkMetricsStore();
+  const metricReconciliation = metricsStore.reconcile(metricJobs, new Date(), {
+    verifySucceededArtifacts: opts.upload || jobsToGenerate.length > 0,
+  });
+  for (const warning of metricReconciliation.warnings) console.warn(`  ⚠️  ${warning}`);
+
+  if (opts.openrouter && opts.generate) {
+    if (!process.env.OPENROUTER_API_KEY) {
+      console.error("\nError: --openrouter requires OPENROUTER_API_KEY.\n");
+      process.exit(1);
+    }
+  }
+
+  const modelCountForSummary = selectedModelKeys.length;
+  console.log(`📋 Total jobs: ${allJobs.length} (${filteredPromptSlugs.length} prompts × ${modelCountForSummary} models)`);
+
+  if (opts.promptFilters.length > 0) console.log(`   Filtered by prompt(s): ${opts.promptFilters.join(", ")}`);
+  if (opts.modelFilters.length > 0) console.log(`   Filtered by model(s): ${opts.modelFilters.join(", ")}`);
+  if (opts.openrouter) console.log("   Provider override: OpenRouter");
+  if (opts.reasoning) console.log(`   Reasoning override: ${opts.reasoning}`);
+
+  printStatus(allJobs);
+
+  const existing = allJobs.filter((j) => !isEmptyPlaceholder(j.filePath));
+  console.log(`\n🔍 Missing builds: ${missing.length}`);
+
+  // Upload failures from either path must reach the exit status: publication
+  // treats a zero exit as a complete import.
+  let uploadFailureCount = 0;
+
+  // upload existing builds if requested
+  if (opts.upload) {
+    if (existing.length === 0) {
+      console.log("\n📤 No existing builds to upload.");
+    } else {
+      console.log("\n📤 Uploading existing builds...");
+      // shared with the generated-build upload below via uploadFailureCount
+      for (const job of existing) {
+        process.stdout.write(`  Uploading ${job.promptSlug} × ${job.modelSlug}...`);
+        const result = await uploadBuild(job, metricsStore.getSample(job)?.inferenceTimeMs);
+        console.log(result.ok ? " ✅" : ` ❌ ${result.error}`);
+        if (!result.ok) uploadFailureCount += 1;
+      }
+    }
+  }
+
+  // generate missing builds only if --generate flag is set
+  if (opts.generate) {
+    const importOnlyModels = getImportOnlyModelsForGenerationJobs(jobsToGenerate);
+    if (importOnlyModels.length > 0) {
+      console.error(
+        "\nError: these models are import-only and cannot be generated through provider APIs:\n" +
+          importOnlyModels.map((m) => `  - ${MODEL_SLUG[m.key]} (${m.displayName})`).join("\n") +
+          "\n\nDrop JSON files into existing upload prompt folders, for example uploads/castle/castle-gpt-4-5-web-harness.json, then run upload/status without --generate.\n",
+      );
+      process.exit(1);
+    }
+  }
+  if (opts.openrouter && opts.generate && jobsToGenerate.length > 0) {
+    const missingOpenRouter = getModelsMissingOpenRouterForGenerationJobs(jobsToGenerate);
+    if (missingOpenRouter.length > 0) {
+      console.error(
+        "\nError: --openrouter was requested, but these models are not integrated via OpenRouter:\n" +
+          missingOpenRouter.map((m) => `  - ${m}`).join("\n") +
+          "\n\nAdd openRouterModelId in lib/ai/modelCatalog.ts or remove these models from the selection.\n"
+      );
+      process.exit(1);
+    }
+  }
+  if (opts.generate && jobsToGenerate.length > 0 && opts.concurrency > jobsToGenerate.length) {
+    console.error(
+      `\nError: --concurrency ${opts.concurrency} exceeds the number of selected build jobs (${jobsToGenerate.length}).\n` +
+        `Lower --concurrency or broaden the prompt/model selection.\n`
+    );
+    process.exit(1);
+  }
+  if (opts.generate && jobsToGenerate.length > 0) {
+    console.log(`\n🚀 Starting generation (concurrency ${opts.concurrency})...\n`);
+
+    let success = 0;
+    let failed = 0;
+    let started = 0;
+    let completed = 0;
+    const total = jobsToGenerate.length;
+
+    const queue = [...jobsToGenerate];
+    let inFlight = 0;
+    let stopRequested = false;
+    let stopSignal: NodeJS.Signals | null = null;
+    const active = new Map<string, { job: Job; controller: AbortController }>();
+    const handleStop = (signal: NodeJS.Signals) => {
+      if (stopRequested) {
+        console.error(`\n  ⏹ ${signal} received again. Exiting immediately.`);
+        process.exit(130);
+      }
+      stopRequested = true;
+      stopSignal = signal;
+      console.log(`\n  ⏸ ${signal} received. Stopping new jobs and recording active jobs as interrupted...`);
+      for (const { job, controller } of active.values()) {
+        metricsStore.markInterrupted(job, `Interrupted by ${signal}.`);
+        controller.abort();
+      }
+    };
+    const handleSigint = () => handleStop("SIGINT");
+    const handleSigterm = () => handleStop("SIGTERM");
+    process.on("SIGINT", handleSigint);
+    process.on("SIGTERM", handleSigterm);
+
+    try {
+      await new Promise<void>((resolve) => {
+        const launchNext = () => {
+          while (!stopRequested && inFlight < opts.concurrency && queue.length > 0) {
+            const job = queue.shift()!;
+            started += 1;
+            const startOrdinal = started;
+            console.log(`  ▶ [${startOrdinal}/${total}] ${jobLabel(job)}`);
+            inFlight += 1;
+            const controller = new AbortController();
+            active.set(jobLabel(job), { job, controller });
+            metricsStore.markRunning(job);
+            void (async () => {
+              const result = await generateAndSave(
+                job,
+                opts.attempts,
+                !opts.notools,
+                opts.openrouter,
+                opts.reasoning,
+                metricsStore,
+                controller.signal,
+              );
+              active.delete(jobLabel(job));
+              const elapsed = formatDuration(result.generationTimeMs);
+              if (result.ok) {
+                const fileLink = formatFileLink(job.filePath);
+                console.log(
+                  `    ✅ [${jobLabel(job)}] Saved ${fileLink.displayPath} (${result.blockCount} blocks, ${elapsed}, ${formatBytes(result.jsonBytes)}, ${result.attemptCount} attempt${result.attemptCount === 1 ? "" : "s"})`,
+                );
+                console.log(`    🔗 [${jobLabel(job)}] Open: ${fileLink.absoluteUrl}`);
+                success++;
+
+                if (opts.upload) {
+                  console.log(`    📤 [${jobLabel(job)}] Uploading...`);
+                  const uploadResult = await uploadBuild(job, result.generationTimeMs);
+                  console.log(
+                    uploadResult.ok
+                      ? `    ✅ [${jobLabel(job)}] Upload complete`
+                      : `    ❌ [${jobLabel(job)}] Upload failed: ${uploadResult.error}`,
+                  );
+                  if (!uploadResult.ok) uploadFailureCount += 1;
+                }
+              } else if (controller.signal.aborted) {
+                console.log(`    ⏸ [${jobLabel(job)}] Interrupted after ${elapsed}`);
+              } else {
+                console.log(
+                  `    ❌ [${jobLabel(job)}] Failed after ${elapsed}: ${result.error}`,
+                );
+                failed++;
+              }
+              completed += 1;
+              console.log(`    • Progress: ${completed}/${total} complete (${inFlight - 1} still running)`);
+            })()
+              .catch((err) => {
+                const message = err instanceof Error ? err.message : String(err);
+                if (controller.signal.aborted) {
+                  console.log(`    ⏸ [${jobLabel(job)}] Interrupted: ${message}`);
+                } else {
+                  metricsStore.markFailed(job, message);
+                  failed++;
+                  console.log(`    ❌ [${jobLabel(job)}] Failed: ${message}`);
+                }
+                completed += 1;
+                console.log(`    • Progress: ${completed}/${total} complete (${inFlight - 1} still running)`);
+              })
+              .finally(() => {
+                active.delete(jobLabel(job));
+                inFlight -= 1;
+                if ((queue.length === 0 || stopRequested) && inFlight === 0) {
+                  resolve();
+                } else {
+                  launchNext();
+                }
+              });
+          }
+        };
+        launchNext();
+      });
+    } finally {
+      process.off("SIGINT", handleSigint);
+      process.off("SIGTERM", handleSigterm);
+    }
+
+    console.log(`\n📊 Results: ${success} succeeded, ${failed} failed`);
+    if (stopSignal) process.exitCode = 130;
+    else if (failed > 0) process.exitCode = 1;
+  } else if (missing.length > 0 && !opts.generate) {
+    console.log("\n💡 Use --generate to generate missing builds.");
+  } else if (missing.length === 0) {
+    console.log("✨ All builds already exist!");
+  }
+
+  // One report for both upload paths. Publication treats a zero exit as a
+  // complete import, so any failed upload has to fail the command.
+  if (uploadFailureCount > 0) {
+    console.error(`\n${uploadFailureCount} upload(s) failed.`);
+    if (process.exitCode !== 130) process.exitCode = 1;
+  }
+
+  if (!opts.upload) {
+    printUploadCommands(allJobs);
+  }
+  printBenchmarkSummary(
+    metricsStore.summarize(metricJobs, {
+      refreshArtifacts:
+        metricReconciliation.refreshRequired ||
+        opts.upload ||
+        (opts.generate && jobsToGenerate.length > 0),
+    }),
+  );
+}
+
+const isDirectRun = process.argv[1]
+  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}

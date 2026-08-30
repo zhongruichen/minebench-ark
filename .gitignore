@@ -1,0 +1,97 @@
+# IDE-Specific and Editor Files
+.idea
+*.iml
+.DS_Store
+
+# AI/MCP Related Files
+CLAUDE.md
+AGENTS.md
+AGENTS.*
+.serena
+.codex
+.claude
+.cursor/
+.gemini-clipboard/
+.playwright-mcp/
+TODO*
+PROJECT_*
+PLAN.md
+
+# Environment and Configuration
+.env
+.env.local
+.env.*.local
+!.env.example
+.venv
+
+# Dependencies
+node_modules
+package-lock.json
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Build and Compilation Output
+/.next/
+/out/
+/build
+/coverage
+/test-results
+.turbo
+voxel-build.json
+.custom-build-storage/
+/custom-builds/
+
+# Database
+prisma/dev.db
+backups/
+*.dump
+*.sql
+*.sql.gz
+*.backup
+!prisma/migrations/**/migration.sql
+
+# Python Specific
+__pycache__
+*.pyc
+
+# Debug
+*.log
+
+uploads
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.npm-cache/
+.pnpm-store/*
+
+# Misc
+*.pem
+*.bak
+
+# Git Related
+.gitattributes
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+/.swc
+
+# custom gateway probe artifacts
+.probe-out/
+.btest/
+
+# bench run artifacts
+.bench-out/
+
+# Upstream README media (large, not needed for this fork)
+.github/assets/
+.github/workflows/

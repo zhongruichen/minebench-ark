@@ -1,0 +1,737 @@
+import type {
+  ArenaBuildLoadHints,
+  ArenaBuildStreamEvent,
+  ArenaBuildVariant,
+} from "@/lib/arena/types";
+import type { VoxelBuild, VoxelBlock } from "@/lib/voxel/types";
+import {
+  deleteSupabaseStorageObjects,
+  getSupabaseStorageConfig,
+} from "@/lib/storage/buildPayload";
+import {
+  getArenaCanonicalStreamArtifactRef,
+  getArenaLegacyStreamArtifactRef,
+  getArenaStreamArtifactLocation,
+  uploadArenaBuildArtifact,
+} from "@/lib/arena/artifactOwnership";
+import { gzipSync } from "node:zlib";
+
+const ENCODER = new TextEncoder();
+
+const ARENA_STREAM_TARGET_CHUNK_BYTES = readIntEnv(
+  "ARENA_STREAM_TARGET_CHUNK_BYTES",
+  1_200_000,
+  64_000,
+  8_000_000,
+);
+const ARENA_STREAM_MIN_BLOCKS = readIntEnv(
+  "ARENA_STREAM_MIN_BLOCKS",
+  10_000,
+  1_000,
+  200_000,
+);
+const ARENA_STREAM_MAX_CHUNKS = readIntEnv(
+  "ARENA_STREAM_MAX_CHUNKS",
+  96,
+  4,
+  256,
+);
+const ARENA_STREAM_MIN_CHUNK_BLOCKS = readIntEnv(
+  "ARENA_STREAM_MIN_CHUNK_BLOCKS",
+  2_000,
+  250,
+  100_000,
+);
+const ARENA_STREAM_MAX_CHUNK_BLOCKS = readIntEnv(
+  "ARENA_STREAM_MAX_CHUNK_BLOCKS",
+  95_000,
+  5_000,
+  1_000_000,
+);
+const ARENA_STREAM_HELLO_PAD_BYTES = readIntEnv(
+  "ARENA_STREAM_HELLO_PAD_BYTES",
+  2_048,
+  0,
+  16_384,
+);
+
+const ARENA_STREAM_ARTIFACTS_ENABLED = readBoolEnv("ARENA_STREAM_ARTIFACTS_ENABLED", true);
+const ARENA_STREAM_ARTIFACT_MISS_TTL_MS = readIntEnv(
+  "ARENA_STREAM_ARTIFACT_MISS_TTL_MS",
+  1_000,
+  1_000,
+  60 * 60 * 1000,
+);
+const ARENA_STREAM_ARTIFACT_SIGN_REDIRECTS_ENABLED = readBoolEnv(
+  "ARENA_STREAM_ARTIFACT_SIGN_REDIRECTS_ENABLED",
+  true,
+);
+const ARENA_STREAM_ARTIFACT_SIGN_URL_TTL_SEC = readIntEnv(
+  "ARENA_STREAM_ARTIFACT_SIGN_URL_TTL_SEC",
+  3600,
+  15,
+  3600,
+);
+const ARENA_STREAM_ARTIFACT_CACHE_CONTROL =
+  process.env.ARENA_STREAM_ARTIFACT_CACHE_CONTROL ?? "public, max-age=31536000, immutable";
+
+function readBoolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  return fallback;
+}
+
+function readIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function encodeStoragePath(path: string): string {
+  return path
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function clampInt(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function normalizeEstimatedBytes(value: number | null | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+function estimateBytesFromBlockCount(totalBlocks: number): number {
+  // Typical compact JSON footprint for a block entry in this schema.
+  return Math.floor(totalBlocks * 34);
+}
+
+export type ArenaBuildStreamPlan = {
+  totalBlocks: number;
+  estimatedBytes: number | null;
+  chunkCount: number;
+  chunkBlockCount: number;
+};
+
+export function estimateArenaBuildVariantBytes(
+  hints: ArenaBuildLoadHints | undefined,
+  variant: ArenaBuildVariant,
+  totalBlocks: number,
+): number | null {
+  if (!hints) return estimateBytesFromBlockCount(totalBlocks);
+  if (variant === "preview") {
+    if (hints.initialVariant === "preview") {
+      return normalizeEstimatedBytes(hints.initialEstimatedBytes) ?? estimateBytesFromBlockCount(totalBlocks);
+    }
+    if (hints.previewBlockCount > 0) {
+      return estimateBytesFromBlockCount(hints.previewBlockCount);
+    }
+  }
+  return normalizeEstimatedBytes(hints.fullEstimatedBytes) ?? estimateBytesFromBlockCount(totalBlocks);
+}
+
+export function planArenaBuildStream(opts: {
+  totalBlocks: number;
+  hints?: ArenaBuildLoadHints;
+  variant?: ArenaBuildVariant;
+}): ArenaBuildStreamPlan {
+  // chunk by estimated bytes so progress feels steady across block counts
+  const totalBlocks = Math.max(0, Math.floor(opts.totalBlocks));
+  if (totalBlocks === 0) {
+    return {
+      totalBlocks: 0,
+      estimatedBytes: 0,
+      chunkCount: 0,
+      chunkBlockCount: 0,
+    };
+  }
+
+  const estimatedBytes =
+    estimateArenaBuildVariantBytes(opts.hints, opts.variant ?? "full", totalBlocks) ??
+    estimateBytesFromBlockCount(totalBlocks);
+
+  if (totalBlocks < ARENA_STREAM_MIN_BLOCKS || estimatedBytes <= ARENA_STREAM_TARGET_CHUNK_BYTES) {
+    return {
+      totalBlocks,
+      estimatedBytes,
+      chunkCount: 1,
+      chunkBlockCount: totalBlocks,
+    };
+  }
+
+  const chunkCountFromBytes = Math.ceil(estimatedBytes / ARENA_STREAM_TARGET_CHUNK_BYTES);
+  const boundedChunkCount = clampInt(chunkCountFromBytes, 1, Math.min(ARENA_STREAM_MAX_CHUNKS, totalBlocks));
+
+  let chunkBlockCount = Math.ceil(totalBlocks / boundedChunkCount);
+  chunkBlockCount = clampInt(
+    chunkBlockCount,
+    ARENA_STREAM_MIN_CHUNK_BLOCKS,
+    ARENA_STREAM_MAX_CHUNK_BLOCKS,
+  );
+
+  const chunkCount = Math.ceil(totalBlocks / chunkBlockCount);
+  return {
+    totalBlocks,
+    estimatedBytes,
+    chunkCount,
+    chunkBlockCount,
+  };
+}
+
+export type ArenaBuildChunk = {
+  index: number;
+  chunkCount: number;
+  receivedBlocks: number;
+  totalBlocks: number;
+  blocks: VoxelBlock[];
+};
+
+export function* iterateArenaBuildChunks(
+  build: VoxelBuild,
+  chunkBlockCount: number,
+): Generator<ArenaBuildChunk> {
+  const safeChunkSize = Math.max(1, Math.floor(chunkBlockCount));
+  const totalBlocks = build.blocks.length;
+  const chunkCount = Math.ceil(totalBlocks / safeChunkSize);
+
+  for (let index = 0; index < chunkCount; index += 1) {
+    const start = index * safeChunkSize;
+    const end = Math.min(totalBlocks, start + safeChunkSize);
+    yield {
+      index: index + 1,
+      chunkCount,
+      receivedBlocks: end,
+      totalBlocks,
+      blocks: build.blocks.slice(start, end),
+    };
+  }
+}
+
+export function encodeArenaBuildStreamEvent(event: ArenaBuildStreamEvent): Uint8Array {
+  return ENCODER.encode(`${JSON.stringify(event)}\n`);
+}
+
+async function readArtifactChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+) {
+  if (!signal) return reader.read();
+  if (signal.aborted) throw signal.reason;
+  return new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      void reader.cancel(signal.reason).catch(() => undefined);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+export async function rewriteBlindArenaBuildStreamIdentity(
+  body: ReadableStream<Uint8Array>,
+  buildId: string,
+  signal?: AbortSignal,
+): Promise<ReadableStream<Uint8Array>> {
+  const [probe, replay] = body.tee();
+  const reader = probe.getReader();
+  const prefix: number[] = [];
+  try {
+    while (prefix.length < 2) {
+      const next = await readArtifactChunk(reader, signal);
+      if (next.done) break;
+      for (const byte of next.value) {
+        prefix.push(byte);
+        if (prefix.length === 2) break;
+      }
+    }
+  } catch (error) {
+    void replay.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+
+  const decoded =
+    prefix[0] === 0x1f && prefix[1] === 0x8b
+      ? replay.pipeThrough(
+          new DecompressionStream("gzip") as unknown as TransformStream<Uint8Array, Uint8Array>,
+        )
+      : replay;
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let pending = "";
+  const rewriteLine = (line: string) => {
+    if (!line.trim()) return line;
+    try {
+      const event = JSON.parse(line) as ArenaBuildStreamEvent;
+      return event.type === "hello"
+        ? JSON.stringify({ ...event, buildId, checksum: null })
+        : line;
+    } catch {
+      return line;
+    }
+  };
+  return decoded.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        pending += decoder.decode(chunk, { stream: true });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) controller.enqueue(encoder.encode(`${rewriteLine(line)}\n`));
+      },
+      flush(controller) {
+        pending += decoder.decode();
+        if (pending) controller.enqueue(encoder.encode(rewriteLine(pending)));
+      },
+    }),
+  );
+}
+
+export const ARENA_BUILD_STREAM_HELLO_PAD =
+  ARENA_STREAM_HELLO_PAD_BYTES > 0 ? " ".repeat(ARENA_STREAM_HELLO_PAD_BYTES) : "";
+
+export type ArenaBuildStreamArtifactRef = {
+  bucket: string;
+  path: string;
+};
+
+type StorageListItem = {
+  name?: string | null;
+  updated_at?: string | null;
+  id?: string | null;
+  metadata?: unknown;
+};
+
+const legacyArtifactDiscoveryCache = new Map<string, ArenaBuildStreamArtifactRef | null>();
+// Repeated missing-artifact lookups are pure latency; cache misses briefly and fall back immediately.
+const artifactMissCache = new Map<string, number>();
+const artifactSignedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+const artifactSignedUrlInflight = new Map<string, Promise<string | null>>();
+const ARTIFACT_MISS_CACHE_PRUNE_INTERVAL = 256;
+let artifactMissCacheTouches = 0;
+
+export function isArenaBuildStreamArtifactEnabled(): boolean {
+  return Boolean(ARENA_STREAM_ARTIFACTS_ENABLED && getArenaStreamArtifactLocation());
+}
+
+function getArtifactMissCacheKey(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+): string {
+  return `${buildId}:${variant}:${checksum?.trim() || "none"}`;
+}
+
+function hasFreshArtifactMiss(cacheKey: string): boolean {
+  const now = Date.now();
+  maybePruneArtifactMissCache(now);
+  const expiresAt = artifactMissCache.get(cacheKey);
+  if (!expiresAt) return false;
+  if (expiresAt <= now) {
+    artifactMissCache.delete(cacheKey);
+    return false;
+  }
+  return true;
+}
+
+function maybePruneArtifactMissCache(now: number): void {
+  artifactMissCacheTouches += 1;
+  if (artifactMissCacheTouches < ARTIFACT_MISS_CACHE_PRUNE_INTERVAL) return;
+  artifactMissCacheTouches = 0;
+
+  for (const [key, expiresAt] of artifactMissCache) {
+    if (expiresAt <= now) {
+      artifactMissCache.delete(key);
+    }
+  }
+  for (const [key, entry] of artifactSignedUrlCache) {
+    if (entry.expiresAt <= now) {
+      artifactSignedUrlCache.delete(key);
+    }
+  }
+}
+
+export function rememberArenaBuildStreamArtifactMiss(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+): void {
+  const now = Date.now();
+  maybePruneArtifactMissCache(now);
+  artifactMissCache.set(
+    getArtifactMissCacheKey(buildId, variant, checksum),
+    now + ARENA_STREAM_ARTIFACT_MISS_TTL_MS,
+  );
+}
+
+export function clearArenaBuildStreamArtifactMiss(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+): void {
+  artifactMissCache.delete(getArtifactMissCacheKey(buildId, variant, checksum));
+}
+
+export function getArenaBuildStreamArtifactRef(
+  _buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+): ArenaBuildStreamArtifactRef | null {
+  if (!isArenaBuildStreamArtifactEnabled()) return null;
+  return getArenaCanonicalStreamArtifactRef(variant, checksum);
+}
+
+export function getArenaBuildStreamArtifactFetchRefs(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+): ArenaBuildStreamArtifactRef[] {
+  if (!checksum?.trim() || !isArenaBuildStreamArtifactEnabled()) return [];
+
+  const refs: ArenaBuildStreamArtifactRef[] = [];
+  const preferred = getArenaCanonicalStreamArtifactRef(variant, checksum);
+  if (preferred) refs.push(preferred);
+
+  const legacy = getArenaLegacyStreamArtifactRef(buildId, variant, checksum);
+  if (legacy && (!preferred || legacy.path !== preferred.path || legacy.bucket !== preferred.bucket)) {
+    refs.push(legacy);
+  }
+
+  return refs;
+}
+
+async function discoverLegacyArenaBuildStreamArtifactRef(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  opts?: { signal?: AbortSignal },
+): Promise<ArenaBuildStreamArtifactRef | null> {
+  const cacheKey = `${buildId}:${variant}`;
+  if (legacyArtifactDiscoveryCache.has(cacheKey)) {
+    // old artifact names are a migration fallback, not a hot lookup
+    return legacyArtifactDiscoveryCache.get(cacheKey) ?? null;
+  }
+  if (!isArenaBuildStreamArtifactEnabled()) {
+    legacyArtifactDiscoveryCache.set(cacheKey, null);
+    return null;
+  }
+  const location = getArenaStreamArtifactLocation();
+  if (!location) {
+    legacyArtifactDiscoveryCache.set(cacheKey, null);
+    return null;
+  }
+
+  let config: ReturnType<typeof getSupabaseStorageConfig>;
+  try {
+    config = getSupabaseStorageConfig();
+  } catch {
+    legacyArtifactDiscoveryCache.set(cacheKey, null);
+    return null;
+  }
+
+  const prefix = `${location.prefix}/${buildId}`;
+  const resp = await fetch(
+    `${config.url}/storage/v1/object/list/${encodeURIComponent(location.bucket)}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.serviceRoleKey}`,
+        apikey: config.serviceRoleKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prefix,
+        limit: 200,
+        offset: 0,
+        sortBy: { column: "name", order: "asc" },
+      }),
+      cache: "no-store",
+      signal: opts?.signal,
+    },
+  );
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Legacy stream artifact list failed (${resp.status}): ${text || "empty response"}`);
+  }
+
+  const pattern = new RegExp(`^${variant}-[^/]+\\.ndjson$`);
+  const items = ((await resp.json()) as StorageListItem[])
+    .filter((item) => {
+      const name = item?.name?.trim();
+      return Boolean(name && pattern.test(name));
+    })
+    .sort((a, b) => {
+      const aTime = Date.parse(a.updated_at ?? "") || 0;
+      const bTime = Date.parse(b.updated_at ?? "") || 0;
+      return bTime - aTime;
+    });
+
+  const name = items[0]?.name?.trim();
+  const ref = name
+    ? {
+        bucket: location.bucket,
+        path: `${prefix}/${name}`,
+      }
+    : null;
+  legacyArtifactDiscoveryCache.set(cacheKey, ref);
+  return ref;
+}
+
+export type ArenaBuildStreamEventSequenceInput = {
+  buildId: string;
+  variant: ArenaBuildVariant;
+  checksum: string | null;
+  build: VoxelBuild;
+  buildLoadHints?: ArenaBuildLoadHints;
+  source: "live" | "artifact";
+  serverValidated: boolean;
+  includePad?: boolean;
+  durationMs?: number;
+};
+
+export function* iterateArenaBuildStreamEvents(
+  input: ArenaBuildStreamEventSequenceInput,
+): Generator<ArenaBuildStreamEvent> {
+  // artifacts and live streams use the same event shape
+  const plan = planArenaBuildStream({
+    totalBlocks: input.build.blocks.length,
+    hints: input.buildLoadHints,
+    variant: input.variant,
+  });
+
+  yield {
+    type: "hello",
+    buildId: input.buildId,
+    variant: input.variant,
+    checksum: input.checksum,
+    serverValidated: input.serverValidated,
+    buildLoadHints: input.buildLoadHints,
+    totalBlocks: plan.totalBlocks,
+    chunkCount: plan.chunkCount,
+    chunkBlockCount: plan.chunkBlockCount,
+    estimatedBytes: plan.estimatedBytes,
+    source: input.source,
+    pad: input.includePad ? ARENA_BUILD_STREAM_HELLO_PAD : undefined,
+  };
+
+  for (const chunk of iterateArenaBuildChunks(input.build, plan.chunkBlockCount || 1)) {
+    yield {
+      type: "chunk",
+      ...chunk,
+    };
+  }
+
+  yield {
+    type: "complete",
+    totalBlocks: plan.totalBlocks,
+    durationMs: Math.max(0, Math.floor(input.durationMs ?? 0)),
+  };
+}
+
+export async function fetchArenaBuildStreamArtifact(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+  opts?: { signal?: AbortSignal },
+): Promise<Response | null> {
+  const missCacheKey = getArtifactMissCacheKey(buildId, variant, checksum);
+  if (hasFreshArtifactMiss(missCacheKey)) {
+    // live stream is faster than repeating a known miss
+    return null;
+  }
+
+  let config: ReturnType<typeof getSupabaseStorageConfig>;
+  try {
+    config = getSupabaseStorageConfig();
+  } catch {
+    return null;
+  }
+
+  for (const ref of getArenaBuildStreamArtifactFetchRefs(buildId, variant, checksum)) {
+    const encodedPath = encodeStoragePath(ref.path);
+    const url = `${config.url}/storage/v1/object/${encodeURIComponent(ref.bucket)}/${encodedPath}`;
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${config.serviceRoleKey}`,
+        apikey: config.serviceRoleKey,
+      },
+      cache: "no-store",
+      signal: opts?.signal,
+    });
+
+    if (resp.status === 404) continue;
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      const normalized = text.toLowerCase();
+      const objectMissing =
+        resp.status === 400 &&
+        (normalized.includes("not_found") ||
+          normalized.includes("object not found") ||
+          normalized.includes("\"error\":\"not_found\""));
+      if (objectMissing) continue;
+      throw new Error(`Stream artifact fetch failed (${resp.status}): ${text || "empty response"}`);
+    }
+    artifactMissCache.delete(missCacheKey);
+    return resp;
+  }
+
+  rememberArenaBuildStreamArtifactMiss(buildId, variant, checksum);
+  return null;
+}
+
+export async function createArenaBuildStreamArtifactSignedUrl(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+  opts?: { signal?: AbortSignal; expiresInSec?: number },
+): Promise<string | null> {
+  if (!ARENA_STREAM_ARTIFACT_SIGN_REDIRECTS_ENABLED) return null;
+
+  const missCacheKey = getArtifactMissCacheKey(buildId, variant, checksum);
+  const now = Date.now();
+  maybePruneArtifactMissCache(now);
+  if (hasFreshArtifactMiss(missCacheKey)) {
+    return null;
+  }
+
+  const cachedSignedUrl = artifactSignedUrlCache.get(missCacheKey);
+  if (cachedSignedUrl && cachedSignedUrl.expiresAt > now) {
+    return cachedSignedUrl.url;
+  }
+  const existing = artifactSignedUrlInflight.get(missCacheKey);
+  if (existing) {
+    // coalesce identical sign requests during arena bursts
+    return existing;
+  }
+
+  const promise = (async () => {
+    let config: ReturnType<typeof getSupabaseStorageConfig>;
+    try {
+      config = getSupabaseStorageConfig();
+    } catch {
+      return null;
+    }
+
+    const expiresInSec =
+      typeof opts?.expiresInSec === "number" && Number.isFinite(opts.expiresInSec) && opts.expiresInSec > 0
+        ? Math.floor(opts.expiresInSec)
+        : ARENA_STREAM_ARTIFACT_SIGN_URL_TTL_SEC;
+
+    for (const ref of getArenaBuildStreamArtifactFetchRefs(buildId, variant, checksum)) {
+      const encodedPath = encodeStoragePath(ref.path);
+      const url = `${config.url}/storage/v1/object/sign/${encodeURIComponent(ref.bucket)}/${encodedPath}`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${config.serviceRoleKey}`,
+          apikey: config.serviceRoleKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ expiresIn: expiresInSec }),
+        cache: "no-store",
+        signal: opts?.signal,
+      });
+
+      if (resp.ok) {
+        const body = (await resp.json()) as { signedURL?: string | null };
+        const signedURL = body.signedURL?.trim();
+        if (!signedURL) {
+          throw new Error("Stream artifact signed URL response was missing signedURL");
+        }
+        const fullUrl = signedURL.startsWith("http") ? signedURL : `${config.url}/storage/v1${signedURL}`;
+        artifactMissCache.delete(missCacheKey);
+        artifactSignedUrlCache.set(missCacheKey, {
+          url: fullUrl,
+          expiresAt: now + Math.max(5_000, (expiresInSec - 5) * 1000),
+        });
+        return fullUrl;
+      }
+
+      const text = await resp.text().catch(() => "");
+      const normalized = text.toLowerCase();
+      const objectMissing =
+        normalized.includes("not_found") ||
+        normalized.includes("object not found") ||
+        normalized.includes("\"error\":\"not_found\"");
+      if (resp.status === 404 || (resp.status === 400 && objectMissing)) {
+        continue;
+      }
+
+      throw new Error(`Stream artifact sign failed (${resp.status}): ${text || "empty response"}`);
+    }
+
+    rememberArenaBuildStreamArtifactMiss(buildId, variant, checksum);
+    return null;
+  })();
+
+  artifactSignedUrlInflight.set(missCacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    artifactSignedUrlInflight.delete(missCacheKey);
+  }
+}
+
+export async function uploadArenaBuildStreamArtifact(
+  buildId: string,
+  variant: ArenaBuildVariant,
+  checksum: string | null,
+  body: Uint8Array,
+): Promise<ArenaBuildStreamArtifactRef | null> {
+  const ref = getArenaBuildStreamArtifactRef(buildId, variant, checksum);
+  if (!ref) return null;
+
+  const config = getSupabaseStorageConfig();
+  const encodedPath = encodeStoragePath(ref.path);
+  const url = `${config.url}/storage/v1/object/${encodeURIComponent(ref.bucket)}/${encodedPath}`;
+  const payload = gzipSync(Buffer.from(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength));
+  const accepted = await uploadArenaBuildArtifact(
+    buildId,
+    ref,
+    async () => {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${config.serviceRoleKey}`,
+          apikey: config.serviceRoleKey,
+          "x-upsert": "true",
+          "cache-control": ARENA_STREAM_ARTIFACT_CACHE_CONTROL,
+          "Content-Encoding": "gzip",
+          "Content-Type": "application/x-ndjson",
+        },
+        body: payload,
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(`Stream artifact upload failed (${resp.status}): ${text || "empty response"}`);
+      }
+    },
+    deleteSupabaseStorageObjects,
+  );
+  if (!accepted) {
+    throw new Error("Build was deleted during artifact upload");
+  }
+  clearArenaBuildStreamArtifactMiss(buildId, variant, checksum);
+  return ref;
+}

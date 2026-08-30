@@ -1,0 +1,85 @@
+import { NextResponse } from "next/server";
+import { maxBlocksForGrid } from "@/lib/ai/limits";
+import { getPalette } from "@/lib/blocks/palettes";
+import { prisma } from "@/lib/prisma";
+import { parseVoxelBuildSpec, validateVoxelBuild } from "@/lib/voxel/validate";
+import { resolveBuildPayload } from "@/lib/storage/buildPayload";
+
+export const runtime = "nodejs";
+
+function normalizeGridSize(value: number): 64 | 256 | 512 {
+  if (value === 64 || value === 256 || value === 512) return value;
+  return 256;
+}
+
+function normalizePalette(value: string): "simple" | "advanced" {
+  return value === "advanced" ? "advanced" : "simple";
+}
+
+export async function GET(
+  _request: Request,
+  { params }: { params: Promise<{ buildId: string }> },
+) {
+  const { buildId } = await params;
+
+  const build = await prisma.build.findUnique({
+    where: { id: buildId },
+    select: {
+      id: true,
+      voxelData: true,
+      voxelStorageBucket: true,
+      voxelStoragePath: true,
+      voxelStorageEncoding: true,
+      gridSize: true,
+      palette: true,
+      mode: true,
+      blockCount: true,
+      model: { select: { stealthVariant: { select: { id: true } } } },
+    },
+  });
+
+  if (!build || build.model.stealthVariant) {
+    return NextResponse.json({ error: "Build not found" }, { status: 404 });
+  }
+
+  const gridSize = normalizeGridSize(build.gridSize);
+  const palette = normalizePalette(build.palette);
+  let payload: unknown;
+  try {
+    payload = await resolveBuildPayload(build);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Build payload is unavailable";
+    return NextResponse.json({ error: message }, { status: 422 });
+  }
+
+  const validated = validateVoxelBuild(payload, {
+    gridSize,
+    palette: getPalette(palette),
+    maxBlocks: maxBlocksForGrid(gridSize),
+  });
+
+  let voxelBuild = validated.ok ? validated.value.build : null;
+  if (!voxelBuild) {
+    const parsed = parseVoxelBuildSpec(payload);
+    if (!parsed.ok) {
+      return NextResponse.json({ error: "Build payload is invalid" }, { status: 422 });
+    }
+    voxelBuild = parsed.value;
+  }
+
+  return NextResponse.json(
+    {
+      buildId: build.id,
+      voxelBuild,
+      gridSize,
+      palette,
+      mode: build.mode,
+      blockCount: validated.ok ? validated.value.build.blocks.length : build.blockCount,
+    },
+    {
+      headers: {
+        "Cache-Control": "public, max-age=0, s-maxage=300, stale-while-revalidate=86400",
+      },
+    },
+  );
+}

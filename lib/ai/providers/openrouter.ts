@@ -1,0 +1,468 @@
+import { withMaxOutputTokens } from "@/lib/ai/providers/shared";
+import {
+  modelRecommendedTopP,
+  modelUsesDefaultSampling,
+} from "@/lib/ai/modelRequestProfiles";
+import { attachAbortSignal } from "@/lib/ai/providers/abort";
+import { sanitizeGeminiJsonSchema } from "@/lib/ai/providers/gemini";
+import { consumeSseStream } from "@/lib/ai/providers/sse";
+import { tokenBudgetCandidates } from "@/lib/ai/tokenBudgets";
+import type { ProviderTelemetryCallbacks } from "@/lib/ai/types";
+
+type OpenRouterChatResponse = {
+  choices?: { message?: { content?: unknown } }[];
+};
+
+type OpenRouterStreamChunk = {
+  choices?: { delta?: { content?: unknown } }[];
+};
+
+type TextVerbosity = "low" | "medium" | "high";
+
+const VOXEL_BUILD_JSON_SCHEMA_NAME = "voxel_build_response";
+
+function extractTextFromChatCompletions(data: OpenRouterChatResponse): string {
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (c && typeof c === "object" ? String((c as { text?: unknown }).text ?? "") : ""))
+      .join("");
+  }
+  return "";
+}
+
+function sleepMs(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+type ReasoningConfigAttempt =
+  | { kind: "enabled" }
+  | { kind: "effort"; effort: string }
+  | { kind: "max_tokens"; maxTokens: number }
+  | "__automatic__"
+  | "__default__"
+  | undefined;
+
+function reasoningConfigFallbacks(opts: {
+  automatic?: boolean;
+  enabled?: boolean;
+  efforts?: string[];
+  maxTokens?: number;
+  failClosed?: boolean;
+}): ReasoningConfigAttempt[] {
+  const usesAutomaticReasoning = Boolean(opts.automatic);
+  const explicitlyEnabled = Boolean(opts.enabled);
+  const requested = opts.efforts;
+  const normalized = (requested ?? [])
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  const efforts: ReasoningConfigAttempt[] = [];
+  if (explicitlyEnabled) efforts.push({ kind: "enabled" });
+  for (const v of normalized) {
+    if (!efforts.some((e) => typeof e === "object" && e.kind === "effort" && e.effort === v)) {
+      efforts.push({ kind: "effort", effort: v });
+    }
+  }
+
+  const rawMaxTokens = Number(opts.maxTokens);
+  if (Number.isFinite(rawMaxTokens) && rawMaxTokens > 0) {
+    efforts.push({ kind: "max_tokens", maxTokens: Math.floor(rawMaxTokens) });
+  }
+
+  if (usesAutomaticReasoning && efforts.length === 0) return ["__automatic__"];
+  if (opts.failClosed) {
+    if (efforts.length === 0) {
+      throw new Error("Fail-closed reasoning requires an explicit reasoning configuration.");
+    }
+    return efforts;
+  }
+  if (efforts.length === 0) return [undefined];
+  if (explicitlyEnabled && normalized.length === 0 && !(Number.isFinite(rawMaxTokens) && rawMaxTokens > 0)) {
+    return efforts;
+  }
+  // Fallback to plain reasoning mode when effort enums are not supported,
+  // then disable reasoning only as a final recovery path.
+  return [...efforts, "__default__", undefined];
+}
+
+function clampReasoningBudget(maxTokens: number, completionBudget: number): number {
+  const cap = Math.max(1, Math.floor(completionBudget) - 1);
+  return Math.max(1, Math.min(Math.floor(maxTokens), cap));
+}
+
+function looksLikeTokenLimitError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    b.includes("max_tokens") ||
+    b.includes("max output tokens") ||
+    b.includes("maximum") && b.includes("tokens") ||
+    b.includes("too many tokens") ||
+    b.includes("token limit") ||
+    b.includes("context length")
+  );
+}
+
+function looksLikeReasoningConfigError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    (b.includes("reasoning") &&
+      b.includes("effort") &&
+      (b.includes("invalid") || b.includes("unsupported") || b.includes("enum") || b.includes("unknown"))) ||
+    (b.includes("reasoning") &&
+      b.includes("max_tokens") &&
+      (b.includes("invalid") || b.includes("unsupported") || b.includes("unknown"))) ||
+    (b.includes("reasoning") && b.includes("unsupported")) ||
+    (b.includes("reasoning") && b.includes("unknown")) ||
+    b.includes("only one of \"reasoning.effort\" and \"reasoning.max_tokens\"")
+  );
+}
+
+function looksLikeVerbosityConfigError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    (b.includes("verbosity") &&
+      (b.includes("invalid") ||
+        b.includes("unsupported") ||
+        b.includes("unknown") ||
+        b.includes("not supported"))) ||
+    (b.includes("text.verbosity") && (b.includes("extra") || b.includes("additional") || b.includes("unexpected"))) ||
+    (b.includes("text") &&
+      (b.includes("extra") ||
+        b.includes("additional") ||
+        b.includes("unexpected") ||
+        b.includes("unknown parameter") ||
+        b.includes("not allowed")))
+  );
+}
+
+function defaultTextVerbosity(modelId: string): TextVerbosity | undefined {
+  if (modelId.startsWith("openai/gpt-5.6")) return undefined;
+  return modelId.startsWith("openai/gpt-5") ? "high" : undefined;
+}
+
+function openRouterTemperaturePayload(modelId: string, temperature?: number): { temperature?: number } {
+  if (modelUsesDefaultSampling(modelId)) return {};
+  return { temperature: temperature ?? 0.2 };
+}
+
+function openRouterTopPPayload(topP?: number): { top_p?: number } {
+  return topP === undefined ? {} : { top_p: topP };
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  opts: {
+    tries: number;
+    minDelayMs: number;
+    maxDelayMs: number;
+    onProviderRequest?: () => void;
+  },
+): Promise<Response> {
+  let lastErr: unknown = null;
+  for (let i = 0; i < opts.tries; i++) {
+    try {
+      init.signal?.throwIfAborted();
+      opts.onProviderRequest?.();
+      const res = await fetch(url, init);
+      if (res.status >= 500 || res.status === 429) {
+        if (i === opts.tries - 1) return res;
+        const delay = Math.min(opts.maxDelayMs, opts.minDelayMs * Math.pow(2, i));
+        await sleepMs(delay);
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (i === opts.tries - 1) throw e;
+      const delay = Math.min(opts.maxDelayMs, opts.minDelayMs * Math.pow(2, i));
+      await sleepMs(delay);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("OpenRouter request failed");
+}
+
+export async function openrouterGenerateText(params: {
+  modelId: string;
+  apiKey?: string;
+  system: string;
+  user: string;
+  maxOutputTokens?: number;
+  automaticReasoning?: boolean;
+  enableReasoning?: boolean;
+  reasoningMaxTokens?: number;
+  temperature?: number;
+  jsonSchema?: Record<string, unknown>;
+  requireParameterSupport?: boolean;
+  reasoningEffortAttempts?: string[];
+  requireReasoning?: boolean;
+  signal?: AbortSignal;
+  onDelta?: (delta: string) => void;
+  onTrace?: (message: string) => void;
+  onAcceptedOutputTokens?: (tokens: number) => void;
+} & ProviderTelemetryCallbacks): Promise<{ text: string }> {
+  const apiKey = params.apiKey ?? process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY");
+
+  const baseUrl = process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api";
+  const maxTokens = params.maxOutputTokens ?? 8192;
+  const usesGeminiSchema =
+    params.modelId.startsWith("google/gemini-") || params.modelId.startsWith("google/gemma-");
+  const jsonSchema = usesGeminiSchema
+    ? (sanitizeGeminiJsonSchema(params.jsonSchema) as Record<string, unknown> | undefined)
+    : params.jsonSchema;
+  const responseFormat = !jsonSchema
+    ? undefined
+    : params.modelId.startsWith("google/gemini-") ||
+        params.modelId === "z-ai/glm-5.3" ||
+        params.modelId === "z-ai/glm-5.3-flash"
+      ? { type: "json_object" }
+      : {
+          type: "json_schema",
+          json_schema: {
+            name: VOXEL_BUILD_JSON_SCHEMA_NAME,
+            strict: true,
+            schema: jsonSchema,
+          },
+        };
+  const reasoningAttempts = reasoningConfigFallbacks({
+    automatic: params.automaticReasoning,
+    enabled: params.enableReasoning,
+    efforts: params.reasoningEffortAttempts,
+    maxTokens: params.reasoningMaxTokens,
+    failClosed: params.requireReasoning || params.modelId === "moonshotai/kimi-k3",
+  });
+  let useDefaultVerbosity = Boolean(defaultTextVerbosity(params.modelId));
+
+  const describeReasoningAttempt = (cfg: ReasoningConfigAttempt): string => {
+    if (cfg === "__automatic__") return "automatic";
+    if (cfg === "__default__") return "default";
+    if (cfg == null) return "disabled";
+    if (cfg.kind === "enabled") return "enabled";
+    if (cfg.kind === "effort") return cfg.effort;
+    return `max_tokens=${cfg.maxTokens}`;
+  };
+
+  const controller = new AbortController();
+  const detachAbort = attachAbortSignal(controller, params.signal);
+  const timeout: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    let res: Response | null = null;
+    let lastBody = "";
+    let selectedReasoningLabel: string | null = null;
+    let selectedReasoningMaxTokens: number | undefined;
+    let selectedReasoningTokenBudget: number | null = null;
+    const tokenBudgets = tokenBudgetCandidates(maxTokens);
+    let requireParameters =
+      Boolean(params.jsonSchema) && params.requireParameterSupport !== false;
+    for (const [tokIdx, tok] of tokenBudgets.entries()) {
+      let tryLowerTokenBudget = false;
+      for (const [cfgIdx, cfg] of reasoningAttempts.entries()) {
+        const reasoningConfig =
+          cfg && typeof cfg === "object" && cfg.kind === "enabled"
+            ? { enabled: true }
+            : cfg === "__default__"
+            ? {}
+            : cfg && typeof cfg === "object" && cfg.kind === "effort"
+              ? { effort: cfg.effort }
+              : cfg && typeof cfg === "object" && cfg.kind === "max_tokens"
+                ? { max_tokens: clampReasoningBudget(cfg.maxTokens, tok) }
+              : undefined;
+        while (true) {
+          const textVerbosity = useDefaultVerbosity ? defaultTextVerbosity(params.modelId) : undefined;
+
+          res = await fetchWithRetry(
+            `${baseUrl}/v1/chat/completions`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://minebench.dev",
+                "X-Title": "MineBench",
+                ...(params.onDelta ? { Accept: "text/event-stream" } : {}),
+              },
+              signal: controller.signal,
+              body: JSON.stringify({
+                model: params.modelId,
+                messages: [
+                  { role: "system", content: params.system },
+                  { role: "user", content: params.user },
+                ],
+                ...(requireParameters
+                  ? {
+                      provider: {
+                        require_parameters: true,
+                      },
+                    }
+                  : {}),
+                stream: Boolean(params.onDelta),
+                ...openRouterTemperaturePayload(params.modelId, params.temperature),
+                ...openRouterTopPPayload(modelRecommendedTopP(params.modelId)),
+                max_tokens: tok,
+                reasoning: reasoningConfig,
+                ...(textVerbosity ? { text: { verbosity: textVerbosity } } : {}),
+                ...(responseFormat ? { response_format: responseFormat } : {}),
+              }),
+            },
+            {
+              tries: 3,
+              minDelayMs: 400,
+              maxDelayMs: 2000,
+              onProviderRequest: params.onProviderRequest,
+            },
+          );
+
+          if (res.ok) {
+            selectedReasoningMaxTokens =
+              cfg && typeof cfg === "object" && cfg.kind === "max_tokens"
+                ? clampReasoningBudget(cfg.maxTokens, tok)
+                : undefined;
+            selectedReasoningLabel =
+              typeof selectedReasoningMaxTokens === "number"
+                ? `max_tokens=${selectedReasoningMaxTokens}`
+                : describeReasoningAttempt(cfg);
+            selectedReasoningTokenBudget = tok;
+            break;
+          }
+          lastBody = await res.text().catch(() => "");
+          if (
+            res.status === 404 &&
+            requireParameters &&
+            lastBody.toLowerCase().includes("requested parameters")
+          ) {
+            requireParameters = false;
+            params.onTrace?.(
+              `OpenRouter rejected parameter requirements (HTTP 404); retrying without require_parameters.`,
+            );
+            continue;
+          }
+          if (res.status === 400 && looksLikeTokenLimitError(lastBody)) {
+            tryLowerTokenBudget = true;
+            const nextBudget = tokenBudgets[tokIdx + 1];
+            if (typeof nextBudget === "number") {
+              params.onTrace?.(
+                `OpenRouter rejected max_output_tokens=${tok}; retrying with ${nextBudget}.`,
+              );
+            }
+            break;
+          }
+          if (res.status === 400 && textVerbosity && looksLikeVerbosityConfigError(lastBody)) {
+            useDefaultVerbosity = false;
+            params.onTrace?.(
+              `OpenRouter verbosity '${textVerbosity}' rejected (HTTP ${res.status}); falling back to provider default verbosity.`,
+            );
+            continue;
+          }
+          if (res.status === 400 && cfgIdx < reasoningAttempts.length - 1 && looksLikeReasoningConfigError(lastBody)) {
+            const currentLabel = describeReasoningAttempt(cfg);
+            const nextLabel = describeReasoningAttempt(reasoningAttempts[cfgIdx + 1]);
+            params.onTrace?.(
+              `OpenRouter reasoning config '${currentLabel}' rejected (HTTP ${res.status}); falling back to '${nextLabel}'.`,
+            );
+            break;
+          }
+          break;
+        }
+        if (res?.ok) break;
+        if (tryLowerTokenBudget) break;
+      }
+
+      if (res?.ok) break;
+      if (tryLowerTokenBudget) continue;
+      break;
+    }
+
+    if (!res) throw new Error("OpenRouter request failed");
+
+    if (!res.ok) {
+      const rawBody = lastBody || (await res.text().catch(() => ""));
+      let cleanMessage = rawBody;
+      try {
+        const parsed = JSON.parse(rawBody) as { error?: { message?: string } | string };
+        if (parsed.error && typeof parsed.error === "object" && parsed.error.message) {
+          cleanMessage = parsed.error.message;
+        } else if (typeof parsed.error === "string") {
+          cleanMessage = parsed.error;
+        }
+      } catch {
+        // keep raw body
+      }
+      throw new Error(`OpenRouter error ${res.status}: ${cleanMessage}`);
+    }
+
+    if (res.ok && selectedReasoningLabel) {
+      const budget = selectedReasoningTokenBudget ?? maxTokens;
+      params.onAcceptedOutputTokens?.(budget);
+      params.onAcceptedRequestConfiguration?.({
+        apiMode: "chat_completions",
+        maxOutputTokens: budget,
+        ...(typeof selectedReasoningMaxTokens === "number"
+          ? { reasoningMaxTokens: selectedReasoningMaxTokens }
+          : {}),
+        thinkingMode: `reasoning=${selectedReasoningLabel}`,
+        temperature: modelUsesDefaultSampling(params.modelId)
+          ? "default"
+          : (params.temperature ?? 0.2),
+        textVerbosity:
+          (useDefaultVerbosity ? defaultTextVerbosity(params.modelId) : undefined) ??
+          "default",
+        responseFormat: responseFormat?.type ?? "text",
+      });
+      params.onTrace?.(
+        withMaxOutputTokens(
+          `OpenRouter reasoning config in use: '${selectedReasoningLabel}'.`,
+          budget,
+        ),
+      );
+    }
+    if (res.ok && useDefaultVerbosity) {
+      const textVerbosity = defaultTextVerbosity(params.modelId);
+      if (textVerbosity) {
+        params.onTrace?.(`OpenRouter text verbosity in use: '${textVerbosity}'.`);
+      }
+    }
+
+    if (params.onDelta) {
+      let text = "";
+      await consumeSseStream(res, (evt) => {
+        if (evt.data === "[DONE]") return;
+        let parsed: OpenRouterStreamChunk | null = null;
+        try {
+          parsed = JSON.parse(evt.data) as OpenRouterStreamChunk;
+        } catch {
+          return;
+        }
+        const chunk = parsed?.choices?.[0]?.delta?.content;
+        if (typeof chunk === "string" && chunk) {
+          text += chunk;
+          params.onDelta?.(chunk);
+        }
+      });
+      return { text };
+    }
+
+    const data = (await res.json()) as OpenRouterChatResponse;
+    return { text: extractTextFromChatCompletions(data) };
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("OpenRouter request timed out");
+    }
+    const redactApiKey = (value: string) => value.split(apiKey).join("[redacted]");
+    const message = redactApiKey(err instanceof Error ? err.message : String(err));
+    const cause =
+      err instanceof Error && err.cause
+        ? ` (cause: ${redactApiKey(String(err.cause))})`
+        : "";
+    console.error("OpenRouter network error:", message);
+    if (message.startsWith("OpenRouter HTTP ") || message.startsWith("OpenRouter error ")) {
+      throw new Error(`${message}${cause}`);
+    }
+    throw new Error(`OpenRouter request failed: ${message}${cause}`);
+  } finally {
+    detachAbort();
+    if (timeout) clearTimeout(timeout);
+  }
+}

@@ -1,0 +1,380 @@
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { getModelByKey, ModelKey } from "@/lib/ai/modelCatalog";
+import { extractBestVoxelBuildJson } from "@/lib/ai/jsonExtract";
+import { getPalette } from "@/lib/blocks/palettes";
+import { parseVoxelBuildSpec, validateVoxelBuild } from "@/lib/voxel/validate";
+import { maxBlocksForGrid } from "@/lib/ai/generateVoxelBuild";
+import { gunzipSync } from "node:zlib";
+import { BuildStorageRef, loadBuildJsonFromStorage } from "@/lib/storage/buildPayload";
+import { Prisma } from "@prisma/client";
+import { createHash } from "node:crypto";
+import { maybePrecomputeArenaArtifactsForBuild } from "@/lib/arena/artifactMaintenance";
+import { invalidateArenaBuildMeta } from "@/lib/arena/buildMetaCache";
+import { invalidateArenaCoverageCache } from "@/lib/arena/coverage";
+import {
+  parseGenerationTimeMs,
+  resolveImportedGenerationTimeMs,
+} from "@/lib/arena/importBuildMetrics";
+import { normalizeArenaBuildChecksum } from "@/lib/arena/buildChecksum";
+import { isLoopbackDatabaseUrl } from "@/lib/db/identity";
+import { ARENA_BUILD_DERIVED_METADATA_RESET } from "@/lib/arena/buildArtifacts";
+
+export const runtime = "nodejs";
+
+function requireAdmin(req: Request): string | null {
+  const token = process.env.ADMIN_TOKEN;
+  if (!token) return "Missing ADMIN_TOKEN on server";
+
+  const auth = req.headers.get("authorization");
+  if (!auth) return "Missing Authorization header (expected: Authorization: Bearer <ADMIN_TOKEN>)";
+
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (!match) return "Invalid Authorization header (expected: Authorization: Bearer <ADMIN_TOKEN>)";
+
+  const presented = match[1]?.trim();
+  if (!presented) return "Empty Bearer token (did you set $ADMIN_TOKEN when running curl?)";
+  if (presented !== token.trim()) return "Invalid token (must match ADMIN_TOKEN)";
+  return null;
+}
+
+function truthy(v: string | undefined): boolean {
+  if (!v) return false;
+  const s = v.trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes";
+}
+
+async function readRequestBodyText(req: Request): Promise<{ ok: true; text: string } | { ok: false; error: string; status: number }> {
+  const encoding = (req.headers.get("content-encoding") ?? "").split(",")[0]?.trim().toLowerCase();
+  const bytes = Buffer.from(await req.arrayBuffer());
+
+  const isGzipMagic = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+  const wantsGzip = encoding === "gzip" || encoding === "x-gzip";
+
+  if (wantsGzip || isGzipMagic) {
+    // If a proxy strips Content-Encoding, sniff for gzip magic bytes so uploads still work.
+    // If a platform decompresses but forgets to strip the header, avoid double-gunzipping.
+    if (!isGzipMagic) return { ok: true, text: bytes.toString("utf-8") };
+
+    try {
+      const text = gunzipSync(bytes).toString("utf-8");
+      return { ok: true, text };
+    } catch {
+      return { ok: false, error: "Invalid gzip request body", status: 400 };
+    }
+  }
+
+  if (!encoding || encoding === "identity") {
+    return { ok: true, text: bytes.toString("utf-8") };
+  }
+
+  return { ok: false, error: `Unsupported Content-Encoding: ${encoding}`, status: 415 };
+}
+
+type StorageEnvelope = {
+  storage?: {
+    bucket?: unknown;
+    path?: unknown;
+    encoding?: unknown;
+    byteSize?: unknown;
+    compressedByteSize?: unknown;
+    sha256?: unknown;
+    blockCount?: unknown;
+  };
+};
+
+function parseStorageEnvelope(value: unknown): { ok: true; ref: BuildStorageRef } | { ok: false } {
+  if (!value || typeof value !== "object") return { ok: false };
+
+  const candidate = value as StorageEnvelope;
+  const storage = candidate.storage;
+  if (!storage || typeof storage !== "object") return { ok: false };
+
+  const bucket = typeof storage.bucket === "string" ? storage.bucket.trim() : "";
+  const path = typeof storage.path === "string" ? storage.path.trim() : "";
+  if (!bucket || !path) return { ok: false };
+
+  const encoding = typeof storage.encoding === "string" ? storage.encoding : null;
+  const byteSize =
+    typeof storage.byteSize === "number" && Number.isFinite(storage.byteSize) ? Math.max(0, Math.floor(storage.byteSize)) : null;
+  const compressedByteSize =
+    typeof storage.compressedByteSize === "number" && Number.isFinite(storage.compressedByteSize)
+      ? Math.max(0, Math.floor(storage.compressedByteSize))
+      : null;
+  const sha256 = normalizeArenaBuildChecksum(storage.sha256);
+  if (storage.sha256 != null && !sha256) return { ok: false };
+  const blockCount =
+    typeof storage.blockCount === "number" && Number.isFinite(storage.blockCount)
+      ? Math.max(0, Math.floor(storage.blockCount))
+      : null;
+
+  return {
+    ok: true,
+    ref: {
+      bucket,
+      path,
+      encoding,
+      byteSize,
+      compressedByteSize,
+      sha256,
+      blockCount,
+    },
+  };
+}
+
+export async function POST(req: Request) {
+  const denied = requireAdmin(req);
+  if (denied) return NextResponse.json({ error: denied }, { status: 401 });
+
+  const url = new URL(req.url);
+  const generationTime = parseGenerationTimeMs(url.searchParams.get("generationTimeMs"));
+  if (!generationTime.ok) {
+    return NextResponse.json({ error: generationTime.error }, { status: 400 });
+  }
+  const modelKeyRaw = (url.searchParams.get("modelKey") ?? "").trim();
+  if (!modelKeyRaw) {
+    return NextResponse.json({ error: "Missing required query param: modelKey" }, { status: 400 });
+  }
+
+  let modelKey: ModelKey;
+  try {
+    modelKey = modelKeyRaw as ModelKey;
+    getModelByKey(modelKey);
+  } catch {
+    return NextResponse.json({ error: `Unknown modelKey: ${modelKeyRaw}` }, { status: 400 });
+  }
+
+  const promptId = (url.searchParams.get("promptId") ?? "").trim();
+  const promptText = (url.searchParams.get("promptText") ?? "").trim();
+  if (!promptId && !promptText) {
+    return NextResponse.json({ error: "Missing required query param: promptId or promptText" }, { status: 400 });
+  }
+
+  const overwrite = truthy(url.searchParams.get("overwrite") ?? undefined);
+
+  const gridSizeRaw = url.searchParams.get("gridSize");
+  const gridSize = gridSizeRaw ? Number(gridSizeRaw) : 256;
+  if (gridSize !== 64 && gridSize !== 256 && gridSize !== 512) {
+    return NextResponse.json({ error: "Invalid gridSize (allowed: 64, 256, 512)" }, { status: 400 });
+  }
+
+  const palette = ((url.searchParams.get("palette") ?? "simple").trim().toLowerCase() as "simple" | "advanced");
+  if (palette !== "simple" && palette !== "advanced") {
+    return NextResponse.json({ error: "Invalid palette (allowed: simple, advanced)" }, { status: 400 });
+  }
+
+  const mode = (url.searchParams.get("mode") ?? "precise").trim();
+  if (!mode) return NextResponse.json({ error: "Invalid mode (must be non-empty)" }, { status: 400 });
+
+  // Local imports remain arena-eligible while remote imports stay staged
+  // until publication verifies the complete cohort
+  const enableImportedModels = isLoopbackDatabaseUrl(process.env.DATABASE_URL ?? "");
+  const modelEntry = getModelByKey(modelKey);
+  const model = await prisma.model.upsert({
+    where: { key: modelEntry.key },
+    create: {
+      key: modelEntry.key,
+      provider: modelEntry.provider,
+      modelId: modelEntry.modelId,
+      displayName: modelEntry.displayName,
+      enabled: enableImportedModels,
+      isBaseline: false,
+    },
+    update: {
+      provider: modelEntry.provider,
+      modelId: modelEntry.modelId,
+      displayName: modelEntry.displayName,
+      ...(enableImportedModels ? { enabled: true } : {}),
+    },
+  });
+
+  if (model.isBaseline) {
+    return NextResponse.json({ error: "Cannot import builds for baseline model" }, { status: 400 });
+  }
+
+  const prompt = promptId
+    ? await prisma.prompt.findUnique({ where: { id: promptId } })
+    : await prisma.prompt.upsert({
+        where: { text: promptText },
+        create: { text: promptText, active: true },
+        update: { active: true },
+      });
+
+  if (!prompt) return NextResponse.json({ error: `Unknown promptId: ${promptId}` }, { status: 404 });
+  if (!prompt.active) {
+    await prisma.prompt.update({ where: { id: prompt.id }, data: { active: true } });
+  }
+
+  const rawBody = await readRequestBodyText(req);
+  if (!rawBody.ok) {
+    return NextResponse.json({ error: rawBody.error }, { status: rawBody.status });
+  }
+
+  const raw = rawBody.text;
+  if (!raw.trim()) return NextResponse.json({ error: "Request body is empty (expected voxel build JSON or storage envelope)" }, { status: 400 });
+
+  const json = extractBestVoxelBuildJson(raw);
+  if (!json) {
+    return NextResponse.json({ error: "Could not find a valid JSON object in the request body" }, { status: 400 });
+  }
+
+  const storageEnvelope = parseStorageEnvelope(json);
+  const hasStorageKey = Boolean(json && typeof json === "object" && "storage" in json);
+  if (hasStorageKey && !storageEnvelope.ok) {
+    return NextResponse.json(
+      {
+        error:
+          "Invalid storage envelope. Expected { storage: { bucket, path, encoding?, byteSize?, compressedByteSize?, sha256?, blockCount? } }",
+      },
+      { status: 400 }
+    );
+  }
+
+  const trustedStorageMetadata =
+    storageEnvelope.ok && typeof storageEnvelope.ref.blockCount === "number" && storageEnvelope.ref.blockCount > 0
+      ? storageEnvelope.ref
+      : null;
+
+  let blockCount = trustedStorageMetadata?.blockCount ?? 0;
+  let warnings: string[] = [];
+  let inlineSpec: Prisma.InputJsonValue | null = null;
+  let inlineByteSize: number | null = null;
+  let inlineSha256: string | null = null;
+
+  if (!trustedStorageMetadata) {
+    const buildPayload = storageEnvelope.ok
+      ? await loadBuildJsonFromStorage(storageEnvelope.ref).catch((err) => {
+          const message = err instanceof Error ? err.message : "Failed to download build payload from storage";
+          return { __storageError: message } as const;
+        })
+      : json;
+
+    if (
+      buildPayload &&
+      typeof buildPayload === "object" &&
+      "__storageError" in buildPayload &&
+      typeof buildPayload.__storageError === "string"
+    ) {
+      return NextResponse.json({ error: buildPayload.__storageError }, { status: 400 });
+    }
+
+    const paletteDefs = getPalette(palette);
+    const validated = validateVoxelBuild(buildPayload, {
+      gridSize,
+      palette: paletteDefs,
+      maxBlocks: maxBlocksForGrid(gridSize),
+    });
+    if (!validated.ok) return NextResponse.json({ error: validated.error }, { status: 400 });
+
+    blockCount = validated.value.build.blocks.length;
+    warnings = validated.value.warnings;
+
+    if (!storageEnvelope.ok) {
+      const spec = parseVoxelBuildSpec(buildPayload);
+      if (!spec.ok) return NextResponse.json({ error: spec.error }, { status: 400 });
+
+      inlineSpec = spec.value as Prisma.InputJsonValue;
+      const specJson = JSON.stringify(spec.value);
+      inlineByteSize = Buffer.byteLength(specJson);
+      inlineSha256 = createHash("sha256").update(specJson).digest("hex");
+    }
+  }
+
+  const existing = await prisma.build.findFirst({
+    where: { promptId: prompt.id, modelId: model.id, gridSize, palette, mode },
+  });
+
+  if (existing && !overwrite) {
+    return NextResponse.json(
+      { error: "Build already exists for (promptId, modelKey, gridSize, palette, mode). Use overwrite=1 to replace it." },
+      { status: 409 }
+    );
+  }
+
+  const voxelDataValue = storageEnvelope.ok ? Prisma.DbNull : (inlineSpec as Prisma.InputJsonValue);
+
+  const saved = existing
+      ? await prisma.build.update({
+        where: { id: existing.id },
+        data: {
+          promptId: prompt.id,
+          modelId: model.id,
+          gridSize,
+          palette,
+          mode,
+          voxelData: voxelDataValue,
+          voxelStorageBucket: storageEnvelope.ok ? storageEnvelope.ref.bucket : null,
+          voxelStoragePath: storageEnvelope.ok ? storageEnvelope.ref.path : null,
+          voxelStorageEncoding: storageEnvelope.ok ? storageEnvelope.ref.encoding ?? null : null,
+          voxelByteSize: storageEnvelope.ok ? storageEnvelope.ref.byteSize ?? null : inlineByteSize,
+          voxelCompressedByteSize: storageEnvelope.ok ? storageEnvelope.ref.compressedByteSize ?? null : null,
+          voxelSha256: storageEnvelope.ok ? storageEnvelope.ref.sha256 ?? null : inlineSha256,
+          blockCount,
+          generationTimeMs: resolveImportedGenerationTimeMs(generationTime.value),
+          ...ARENA_BUILD_DERIVED_METADATA_RESET,
+        },
+      })
+    : await prisma.build.create({
+        data: {
+          promptId: prompt.id,
+          modelId: model.id,
+          gridSize,
+          palette,
+          mode,
+          voxelData: voxelDataValue,
+          voxelStorageBucket: storageEnvelope.ok ? storageEnvelope.ref.bucket : null,
+          voxelStoragePath: storageEnvelope.ok ? storageEnvelope.ref.path : null,
+          voxelStorageEncoding: storageEnvelope.ok ? storageEnvelope.ref.encoding ?? null : null,
+          voxelByteSize: storageEnvelope.ok ? storageEnvelope.ref.byteSize ?? null : inlineByteSize,
+          voxelCompressedByteSize: storageEnvelope.ok ? storageEnvelope.ref.compressedByteSize ?? null : null,
+          voxelSha256: storageEnvelope.ok ? storageEnvelope.ref.sha256 ?? null : inlineSha256,
+          blockCount,
+          generationTimeMs: resolveImportedGenerationTimeMs(generationTime.value),
+        },
+      });
+
+  // overwrite imports may replace an existing buildId; drop any cached row eagerly
+  invalidateArenaBuildMeta(saved.id);
+
+  try {
+    await maybePrecomputeArenaArtifactsForBuild({
+      id: saved.id,
+      gridSize: saved.gridSize,
+      palette: saved.palette,
+      blockCount: saved.blockCount,
+      voxelByteSize: saved.voxelByteSize,
+      voxelCompressedByteSize: saved.voxelCompressedByteSize,
+      voxelSha256: saved.voxelSha256,
+      voxelData: saved.voxelData,
+      voxelStorageBucket: saved.voxelStorageBucket,
+      voxelStoragePath: saved.voxelStoragePath,
+      voxelStorageEncoding: saved.voxelStorageEncoding,
+    });
+  } catch (err) {
+    console.warn("import-build artifact precompute skipped", err);
+  }
+
+  invalidateArenaCoverageCache();
+
+  return NextResponse.json({
+    ok: true,
+    buildId: saved.id,
+    prompt: { id: prompt.id, text: prompt.text },
+    model: { id: model.id, key: model.key, provider: model.provider, displayName: model.displayName },
+    settings: { gridSize, palette, mode },
+    blockCount,
+    warnings,
+    overwritten: Boolean(existing),
+    storage: storageEnvelope.ok
+      ? {
+          bucket: storageEnvelope.ref.bucket,
+          path: storageEnvelope.ref.path,
+          encoding: storageEnvelope.ref.encoding ?? null,
+          byteSize: storageEnvelope.ref.byteSize ?? null,
+          compressedByteSize: storageEnvelope.ref.compressedByteSize ?? null,
+          sha256: storageEnvelope.ref.sha256 ?? null,
+          blockCount: storageEnvelope.ref.blockCount ?? null,
+        }
+      : null,
+  });
+}

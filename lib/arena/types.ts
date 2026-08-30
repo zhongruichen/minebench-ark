@@ -1,0 +1,156 @@
+import type { VoxelBlock } from "@/lib/voxel/types";
+import type { RenderableVoxelBuild } from "@/lib/voxel/packedBlocks";
+
+export type VoteChoice = "A" | "B" | "TIE" | "BOTH_BAD";
+export type ArenaAction = VoteChoice | "SKIP";
+
+export type ArenaModelReveal = {
+  provider: string;
+  displayName: string;
+};
+
+export type ArenaVoteResponse = {
+  ok: true;
+  reveal: {
+    a: ArenaModelReveal;
+    b: ArenaModelReveal;
+  };
+};
+
+export type ArenaBuildVariant = "preview" | "full";
+export const ARENA_MESH_FACTS_MIN_BLOCKS = 150_000;
+
+export type ArenaBuildDeliveryClass =
+  | "inline"
+  | "snapshot"
+  | "stream-live"
+  | "stream-artifact";
+
+export type ArenaBuildRef = {
+  buildId: string;
+  variant: ArenaBuildVariant;
+  checksum: string | null;
+};
+
+export type ArenaBuildLoadHints = {
+  initialVariant: ArenaBuildVariant;
+  initialDeliveryClass: ArenaBuildDeliveryClass;
+  deliveryClass: ArenaBuildDeliveryClass;
+  fullBlockCount: number;
+  previewBlockCount: number;
+  previewStride: number;
+  initialEstimatedBytes: number | null;
+  fullEstimatedBytes: number | null;
+};
+
+export type ArenaBuildStreamHelloEvent = {
+  type: "hello";
+  buildId: string;
+  variant: ArenaBuildVariant;
+  checksum: string | null;
+  serverValidated: boolean;
+  buildLoadHints?: ArenaBuildLoadHints;
+  totalBlocks: number;
+  chunkCount: number;
+  chunkBlockCount: number;
+  estimatedBytes: number | null;
+  source: "live" | "artifact";
+  pad?: string;
+};
+
+export type ArenaBuildStreamChunkEvent = {
+  type: "chunk";
+  index: number;
+  chunkCount: number;
+  receivedBlocks: number;
+  totalBlocks: number;
+  blocks: VoxelBlock[];
+};
+
+export type ArenaBuildStreamCompleteEvent = {
+  type: "complete";
+  totalBlocks: number;
+  durationMs: number;
+};
+
+export type ArenaBuildStreamErrorEvent = {
+  type: "error";
+  message: string;
+};
+
+export type ArenaBuildStreamPingEvent = {
+  type: "ping";
+  ts: number;
+};
+
+export type ArenaBuildStreamEvent =
+  | ArenaBuildStreamHelloEvent
+  | ArenaBuildStreamChunkEvent
+  | ArenaBuildStreamCompleteEvent
+  | ArenaBuildStreamErrorEvent
+  | ArenaBuildStreamPingEvent;
+
+export type ArenaMatchup = {
+  id: string;
+  samplingLane?: "coverage" | "contender" | "uncertainty" | "exploration";
+  prompt: { id: string; text: string };
+  a: {
+    model: ArenaModelReveal | null;
+    build: RenderableVoxelBuild | null;
+    buildRef?: ArenaBuildRef;
+    previewRef?: ArenaBuildRef;
+    serverValidated?: boolean;
+    buildLoadHints?: ArenaBuildLoadHints;
+  };
+  b: {
+    model: ArenaModelReveal | null;
+    build: RenderableVoxelBuild | null;
+    buildRef?: ArenaBuildRef;
+    previewRef?: ArenaBuildRef;
+    serverValidated?: boolean;
+    buildLoadHints?: ArenaBuildLoadHints;
+  };
+};
+
+export type ArenaMatchupLane = ArenaMatchup["a"];
+
+export type PromptListResponse = {
+  prompts: { id: string; text: string }[];
+};
+
+export type LeaderboardResponse = {
+  models: {
+    key: string;
+    slug?: string;
+    provider: string;
+    displayName: string;
+    stability: "Provisional" | "Established" | "Stable";
+    eloRating: number;
+    ratingDeviation: number;
+    rankScore: number;
+    ci95?: number;
+    ciLower?: number;
+    ciUpper?: number;
+    confidence: number;
+    rank: number;
+    rankDelta24h: number | null;
+    hasBaseline24h: boolean;
+    movementVisible: boolean;
+    shownCount: number;
+    winCount: number;
+    lossCount: number;
+    drawCount: number;
+    bothBadCount: number;
+    coveredPrompts: number;
+    activePrompts: number;
+    promptCoverage: number;
+    pairCoverageScore: number | null;
+    qualityFloorScore: number | null;
+    meanScore: number | null;
+    scoreVariance: number | null;
+    scoreSpread: number | null;
+    consistency: number | null;
+    sampledPrompts: number;
+    sampledVotes: number;
+  }[];
+};

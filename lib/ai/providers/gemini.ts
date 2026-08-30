@@ -1,0 +1,235 @@
+import { withMaxOutputTokens } from "@/lib/ai/providers/shared";
+import { attachAbortSignal } from "@/lib/ai/providers/abort";
+import { consumeSseStream } from "@/lib/ai/providers/sse";
+import { tokenBudgetCandidates } from "@/lib/ai/tokenBudgets";
+import type { GeminiThinkingConfig } from "@/lib/ai/reasoningProfiles";
+import type { ProviderTelemetryCallbacks } from "@/lib/ai/types";
+
+type JsonSchema = Record<string, unknown>;
+
+const GEMINI_SUPPORTED_JSON_SCHEMA_KEYS = new Set([
+  "$id",
+  "$defs",
+  "$ref",
+  "$anchor",
+  "type",
+  "format",
+  "title",
+  "description",
+  "enum",
+  "items",
+  "prefixItems",
+  "minItems",
+  "maxItems",
+  "minimum",
+  "maximum",
+  "anyOf",
+  "oneOf",
+  "properties",
+  "additionalProperties",
+  "required",
+  "propertyOrdering",
+]);
+
+export function sanitizeGeminiJsonSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeGeminiJsonSchema);
+  if (!value || typeof value !== "object") return value;
+
+  const input = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(input)) {
+    if (!GEMINI_SUPPORTED_JSON_SCHEMA_KEYS.has(key)) continue;
+    if (key === "properties" || key === "$defs") {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      output[key] = Object.fromEntries(
+        Object.entries(entry as Record<string, unknown>).map(([name, schema]) => [
+          name,
+          sanitizeGeminiJsonSchema(schema),
+        ]),
+      );
+      continue;
+    }
+    output[key] = sanitizeGeminiJsonSchema(entry);
+  }
+  return output;
+}
+
+type GeminiGenerateContentResponse = {
+  candidates?: { content?: { parts?: { text?: string }[] } }[];
+};
+
+function bestThinkingConfigForModel(modelId: string): GeminiThinkingConfig | undefined {
+  if (modelId.startsWith("gemini-3")) {
+    return { thinkingLevel: "high" };
+  }
+
+  if (modelId.startsWith("gemma-4")) {
+    return { thinkingLevel: "high" };
+  }
+
+  if (modelId.startsWith("gemini-2.5-pro")) {
+    // Use adaptive/dynamic reasoning budget for 2.5 Pro.
+    return { thinkingBudget: -1 };
+  }
+
+  return undefined;
+}
+
+function usesDefaultSampling(modelId: string): boolean {
+  return modelId.startsWith("gemini-3");
+}
+
+function describeThinkingConfigLine(thinkingConfig?: GeminiThinkingConfig): string {
+  if (thinkingConfig?.thinkingLevel) {
+    return `Gemini thinking level in use: '${thinkingConfig.thinkingLevel}'.`;
+  }
+  if (typeof thinkingConfig?.thinkingBudget === "number") {
+    return `Gemini thinking budget in use: ${thinkingConfig.thinkingBudget}.`;
+  }
+  return "Gemini thinking config in use: default.";
+}
+
+export async function geminiGenerateText(params: {
+  modelId: string;
+  apiKey?: string;
+  system: string;
+  user: string;
+  maxOutputTokens?: number;
+  thinkingConfig?: GeminiThinkingConfig;
+  temperature?: number;
+  jsonSchema?: JsonSchema;
+  signal?: AbortSignal;
+  onDelta?: (delta: string) => void;
+  onTrace?: (message: string) => void;
+  onAcceptedOutputTokens?: (tokens: number) => void;
+} & ProviderTelemetryCallbacks): Promise<{ text: string }> {
+  const apiKey = params.apiKey ?? process.env.GOOGLE_AI_API_KEY;
+  if (!apiKey) throw new Error("Missing GOOGLE_AI_API_KEY");
+  if (!params.jsonSchema) throw new Error("Missing jsonSchema for Gemini JSON mode");
+
+  const method = params.onDelta ? "streamGenerateContent" : "generateContent";
+  const url = new URL(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      params.modelId
+    )}:${method}`
+  );
+  url.searchParams.set("key", apiKey);
+  if (params.onDelta) url.searchParams.set("alt", "sse");
+
+  const controller = new AbortController();
+  const detachAbort = attachAbortSignal(controller, params.signal);
+  const timeout: ReturnType<typeof setTimeout> | null = null;
+  let res: Response | null = null;
+  try {
+    const thinkingConfig = params.thinkingConfig ?? bestThinkingConfigForModel(params.modelId);
+    const thinkingConfigLine = describeThinkingConfigLine(thinkingConfig);
+    const responseJsonSchema = sanitizeGeminiJsonSchema(params.jsonSchema) as JsonSchema;
+    const generationConfig = {
+      ...(usesDefaultSampling(params.modelId) ? {} : { temperature: params.temperature ?? 0.2 }),
+      maxOutputTokens: params.maxOutputTokens ?? 8192,
+      ...(thinkingConfig ? { thinkingConfig } : {}),
+    };
+    const basePayload = {
+      systemInstruction: { parts: [{ text: params.system }] },
+      contents: [{ role: "user", parts: [{ text: params.user }] }],
+      generationConfig,
+    };
+
+    const uniqTokens = tokenBudgetCandidates(basePayload.generationConfig.maxOutputTokens);
+    let successBudget = basePayload.generationConfig.maxOutputTokens;
+    let lastBody = "";
+    for (const tok of uniqTokens) {
+      const payload = {
+        ...basePayload,
+        generationConfig: {
+          ...(basePayload.generationConfig as object),
+          maxOutputTokens: tok,
+          responseMimeType: "application/json",
+          responseJsonSchema,
+        },
+      };
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (params.onDelta) headers.Accept = "text/event-stream";
+      controller.signal.throwIfAborted();
+      params.onProviderRequest?.();
+      res = await fetch(url, {
+        method: "POST",
+        headers,
+        signal: controller.signal,
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        successBudget = tok;
+        break;
+      }
+      lastBody = await res.text().catch(() => "");
+      // Retry with smaller token budget if that looks like the issue
+      if (res.status === 400 && lastBody.toLowerCase().includes("maxoutputtokens")) continue;
+      break;
+    }
+
+    if (!res) throw new Error("Gemini request failed");
+    if (!res.ok) {
+      const body = lastBody || (await res.text().catch(() => ""));
+      throw new Error(`Gemini error ${res.status}: ${body}`);
+    }
+
+    const budget = successBudget ?? basePayload.generationConfig.maxOutputTokens;
+    params.onAcceptedOutputTokens?.(budget);
+    params.onAcceptedRequestConfiguration?.({
+      apiMode: method,
+      maxOutputTokens: budget,
+      ...(typeof thinkingConfig?.thinkingBudget === "number"
+        ? { reasoningMaxTokens: thinkingConfig.thinkingBudget }
+        : {}),
+      thinkingMode: thinkingConfig?.thinkingLevel
+        ? `thinking_level=${thinkingConfig.thinkingLevel}`
+        : typeof thinkingConfig?.thinkingBudget === "number"
+          ? `thinking_budget=${thinkingConfig.thinkingBudget}`
+          : "default",
+      temperature: usesDefaultSampling(params.modelId)
+        ? "default"
+        : (params.temperature ?? 0.2),
+      textVerbosity: "default",
+      responseFormat: "json_schema",
+    });
+    params.onTrace?.(withMaxOutputTokens(thinkingConfigLine, budget));
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Gemini request timed out");
+    }
+    console.error("Gemini network error:", err);
+    const cause = err instanceof Error && err.cause ? ` (cause: ${String(err.cause)})` : "";
+    throw new Error(`Gemini request failed: ${err instanceof Error ? err.message : String(err)}${cause}`);
+  } finally {
+    detachAbort();
+    if (timeout) clearTimeout(timeout);
+  }
+
+  if (!res) throw new Error("Gemini request failed");
+
+  if (params.onDelta) {
+    let text = "";
+    await consumeSseStream(res, (evt) => {
+      if (evt.data === "[DONE]") return;
+      let parsed: GeminiGenerateContentResponse | null = null;
+      try {
+        parsed = JSON.parse(evt.data) as GeminiGenerateContentResponse;
+      } catch {
+        return;
+      }
+      const chunk =
+        parsed.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+      if (!chunk) return;
+      const delta = chunk.startsWith(text) ? chunk.slice(text.length) : chunk;
+      if (!delta) return;
+      text += delta;
+      params.onDelta?.(delta);
+    });
+    return { text };
+  }
+
+  const data = (await res.json()) as GeminiGenerateContentResponse;
+  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+  return { text };
+}

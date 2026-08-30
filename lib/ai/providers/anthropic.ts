@@ -1,0 +1,438 @@
+import { parseBooleanEnv, withMaxOutputTokens } from "@/lib/ai/providers/shared";
+import { claudeCapabilities, type ClaudeEffort } from "@/lib/ai/claudeModels";
+import { attachAbortSignal } from "@/lib/ai/providers/abort";
+import { consumeSseStream } from "@/lib/ai/providers/sse";
+import { tokenBudgetCandidates } from "@/lib/ai/tokenBudgets";
+import type { ProviderTelemetryCallbacks } from "@/lib/ai/types";
+
+type AnthropicMessageResponse = {
+  content?: {
+    type?: string;
+    text?: string;
+    name?: string;
+    input?: unknown;
+  }[];
+};
+
+type AnthropicStreamEvent = {
+  type?: unknown;
+  delta?: { type?: unknown; text?: unknown; partial_json?: unknown } | unknown;
+};
+
+type AnthropicEffort = ClaudeEffort;
+
+const CONTEXT_1M_BETA = "context-1m-2025-08-07";
+const STRUCTURED_OUTPUT_TOOL_NAME = "emit_structured_json";
+function looksLikeTokenLimitError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    b.includes("max_tokens") ||
+    (b.includes("maximum") && b.includes("tokens")) ||
+    b.includes("too many tokens") ||
+    b.includes("token limit")
+  );
+}
+
+function looksLikeContextBetaUnavailableError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    b.includes(CONTEXT_1M_BETA) ||
+    (b.includes("anthropic-beta") &&
+      (b.includes("invalid") ||
+        b.includes("unknown") ||
+        b.includes("unsupported") ||
+        b.includes("not available") ||
+        b.includes("not enabled") ||
+        b.includes("not entitled")))
+  );
+}
+
+function looksLikeStructuredFormatUnsupportedError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    b.includes("output_config") ||
+    b.includes("output format") ||
+    b.includes("output_format") ||
+    b.includes("json_schema") ||
+    b.includes("structured output") ||
+    b.includes("unknown field") ||
+    b.includes("invalid field")
+  );
+}
+
+const ANTHROPIC_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "maxContains",
+  "maxItems",
+  "maxLength",
+  "maxProperties",
+  "maximum",
+  "minContains",
+  "minLength",
+  "minProperties",
+  "minimum",
+  "multipleOf",
+  "pattern",
+  "propertyNames",
+  "unevaluatedProperties",
+  "uniqueItems",
+]);
+
+function sanitizeAnthropicStructuredSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) {
+    return schema.map((value) => sanitizeAnthropicStructuredSchema(value));
+  }
+  if (!schema || typeof schema !== "object") return schema;
+
+  const input = schema as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(input)) {
+    if (ANTHROPIC_UNSUPPORTED_SCHEMA_KEYS.has(key)) continue;
+    if (key === "minItems") {
+      const normalized = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : NaN;
+      if (normalized === 0 || normalized === 1) output[key] = normalized;
+      continue;
+    }
+    if (key === "additionalProperties") {
+      if (value === false) output[key] = false;
+      continue;
+    }
+    if (key === "properties" || key === "definitions") {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const nested: Record<string, unknown> = {};
+      for (const [nestedKey, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+        nested[nestedKey] = sanitizeAnthropicStructuredSchema(nestedValue);
+      }
+      output[key] = nested;
+      continue;
+    }
+    output[key] = sanitizeAnthropicStructuredSchema(value);
+  }
+
+  return output;
+}
+
+function parseThinkingBudget(): number | null {
+  const raw = process.env.ANTHROPIC_THINKING_BUDGET;
+  if (!raw) return null;
+  const val = Number(raw);
+  if (!Number.isFinite(val)) return null;
+  const budget = Math.floor(val);
+  if (budget < 1024) return null;
+  return budget;
+}
+
+// Starts the ladder at the requested level, or at its head when the request
+// names a level this model does not accept
+function effortFallbacks(
+  ladder: readonly AnthropicEffort[],
+  requested: string | undefined,
+): AnthropicEffort[] {
+  const startIndex = Math.max(
+    0,
+    ladder.findIndex((effort) => effort === requested),
+  );
+  return ladder.slice(startIndex);
+}
+
+function looksLikeEffortConfigError(body: string): boolean {
+  const b = body.toLowerCase();
+  return (
+    (b.includes("effort") &&
+      (b.includes("invalid") ||
+        b.includes("unsupported") ||
+        b.includes("unknown") ||
+        b.includes("enum") ||
+        b.includes("must be one of"))) ||
+    (b.includes("output_config") &&
+      b.includes("effort") &&
+      (b.includes("invalid") || b.includes("unsupported") || b.includes("unknown")))
+  );
+}
+
+function parseAdaptiveEfforts(modelId: string): AnthropicEffort[] {
+  const { effortLadder, effortEnvVar } = claudeCapabilities(modelId);
+  const requested = effortEnvVar
+    ? (process.env[effortEnvVar] ?? "").trim().toLowerCase()
+    : undefined;
+  return effortFallbacks(effortLadder, requested);
+}
+
+export async function anthropicGenerateText(params: {
+  modelId: string;
+  apiKey?: string;
+  system: string;
+  user: string;
+  maxTokens: number;
+  adaptiveEffortAttempts?: AnthropicEffort[];
+  temperature?: number;
+  jsonSchema?: Record<string, unknown>;
+  signal?: AbortSignal;
+  onDelta?: (delta: string) => void;
+  onTrace?: (message: string) => void;
+  onAcceptedOutputTokens?: (tokens: number) => void;
+} & ProviderTelemetryCallbacks): Promise<{ text: string }> {
+  const apiKey = params.apiKey ?? process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("Missing ANTHROPIC_API_KEY");
+
+  const controller = new AbortController();
+  const detachAbort = attachAbortSignal(controller, params.signal);
+  const timeout: ReturnType<typeof setTimeout> | null = null;
+
+  const maxTokens = Number.isFinite(params.maxTokens) ? Math.floor(params.maxTokens) : 8192;
+  const useStructuredOutputs = Boolean(params.jsonSchema);
+  const structuredSchema = useStructuredOutputs
+    ? (sanitizeAnthropicStructuredSchema(params.jsonSchema) as Record<string, unknown>)
+    : undefined;
+  const capabilities = claudeCapabilities(params.modelId);
+  const usesAdaptiveThinking = capabilities.adaptiveThinking;
+  const adaptiveEffortAttempts =
+    usesAdaptiveThinking && params.adaptiveEffortAttempts && params.adaptiveEffortAttempts.length > 0
+      ? params.adaptiveEffortAttempts
+      : usesAdaptiveThinking
+        ? parseAdaptiveEfforts(params.modelId)
+        : [];
+  const preferStreaming = Boolean(params.onDelta) || parseBooleanEnv("ANTHROPIC_STREAM_RESPONSES", true);
+  const allowForcedToolStructuredFallback = parseBooleanEnv(
+    "ANTHROPIC_ALLOW_FORCED_TOOL_STRUCTURED_FALLBACK",
+    false,
+  );
+  const thinkingBudget = usesAdaptiveThinking
+    ? null
+    : capabilities.legacyManualThinking
+      ? Math.max(1024, maxTokens - 1)
+      : parseThinkingBudget();
+  const betaHeaders: (string | null)[] =
+    capabilities.context1mBeta && parseBooleanEnv("ANTHROPIC_ENABLE_1M_CONTEXT_BETA", true)
+      ? [CONTEXT_1M_BETA, null]
+      : [null];
+  const tools = useStructuredOutputs
+    ? [
+        {
+          name: STRUCTURED_OUTPUT_TOOL_NAME,
+          description: "Return the final result as JSON that matches the provided schema.",
+          input_schema: structuredSchema as Record<string, unknown>,
+        },
+      ]
+    : undefined;
+
+  let res: Response | null = null;
+  let lastBody = "";
+  let structuredMode: "native_format" | "forced_tool" = "native_format";
+  let didUseStreaming = false;
+  let selectedAdaptiveEffort: AnthropicEffort | null = null;
+  let selectedBetaHeader: string | null = null;
+  let selectedTokenBudget: number | null = null;
+  try {
+    requestLoop: for (const tok of tokenBudgetCandidates(maxTokens)) {
+      betaLoop: for (const betaHeader of betaHeaders) {
+        const useForcedToolStructuredOutput =
+          useStructuredOutputs && structuredMode === "forced_tool";
+        const streamResponses = preferStreaming && !useForcedToolStructuredOutput;
+        const budget =
+          typeof thinkingBudget === "number" ? Math.min(thinkingBudget, tok - 1) : null;
+        const thinking = useForcedToolStructuredOutput
+          ? undefined
+          : usesAdaptiveThinking
+            ? { type: "adaptive" as const }
+            : typeof budget === "number" && budget >= 1024
+              ? { type: "enabled" as const, budget_tokens: budget }
+              : undefined;
+        const temperature = thinking ? 1 : (params.temperature ?? 0.2);
+        const sampling = capabilities.defaultSamplingOnly ? {} : { temperature };
+        const efforts = usesAdaptiveThinking ? adaptiveEffortAttempts : [null];
+        effortLoop: for (let effortIdx = 0; effortIdx < efforts.length; effortIdx += 1) {
+          const effort = efforts[effortIdx];
+          const outputConfig = useStructuredOutputs
+            ? useForcedToolStructuredOutput
+              ? undefined
+              : {
+                ...(usesAdaptiveThinking && effort ? { effort } : {}),
+                format: {
+                  type: "json_schema",
+                  schema: structuredSchema as Record<string, unknown>,
+                },
+              }
+            : usesAdaptiveThinking && effort
+              ? { effort }
+              : undefined;
+
+          controller.signal.throwIfAborted();
+          params.onProviderRequest?.();
+          res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKey,
+              "anthropic-version": "2023-06-01",
+              ...(streamResponses ? { Accept: "text/event-stream" } : {}),
+              ...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
+            },
+            signal: controller.signal,
+            body: JSON.stringify({
+              model: params.modelId,
+              max_tokens: tok,
+              ...sampling,
+              system: params.system,
+              messages: [{ role: "user", content: params.user }],
+              stream: streamResponses,
+              ...(thinking ? { thinking } : {}),
+              ...(outputConfig ? { output_config: outputConfig } : {}),
+              ...(useForcedToolStructuredOutput && tools
+                ? {
+                    tools,
+                    tool_choice: {
+                      type: "tool",
+                      name: STRUCTURED_OUTPUT_TOOL_NAME,
+                      disable_parallel_tool_use: true,
+                    },
+                  }
+                : {}),
+            }),
+          });
+          didUseStreaming = streamResponses;
+
+          if (res.ok) {
+            if (usesAdaptiveThinking) selectedAdaptiveEffort = effort ?? null;
+            selectedBetaHeader = betaHeader;
+            selectedTokenBudget = tok;
+            break requestLoop;
+          }
+          lastBody = await res.text().catch(() => "");
+          if (res.status === 400 && looksLikeTokenLimitError(lastBody)) continue requestLoop;
+          if (betaHeader && looksLikeContextBetaUnavailableError(lastBody)) continue betaLoop;
+          if (
+            usesAdaptiveThinking &&
+            res.status === 400 &&
+            effortIdx < efforts.length - 1 &&
+            looksLikeEffortConfigError(lastBody)
+          ) {
+            const nextEffort = efforts[effortIdx + 1];
+            const currentLabel = effort ?? "default";
+            const nextLabel = nextEffort ?? "default";
+            params.onTrace?.(
+              `Anthropic reasoning effort '${currentLabel}' rejected (HTTP ${res.status}); falling back to '${nextLabel}'.`,
+            );
+            continue effortLoop;
+          }
+          if (
+            useStructuredOutputs &&
+            allowForcedToolStructuredFallback &&
+            structuredMode === "native_format" &&
+            res.status === 400 &&
+            looksLikeStructuredFormatUnsupportedError(lastBody)
+          ) {
+            structuredMode = "forced_tool";
+            continue betaLoop;
+          }
+          break requestLoop;
+        }
+      }
+
+      if (res && !res.ok) break;
+    }
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Anthropic request timed out");
+    }
+    console.error("Anthropic network error:", err);
+    const cause = err instanceof Error && err.cause ? ` (cause: ${String(err.cause)})` : "";
+    throw new Error(`Anthropic request failed: ${err instanceof Error ? err.message : String(err)}${cause}`);
+  } finally {
+    detachAbort();
+    if (timeout) clearTimeout(timeout);
+  }
+
+  if (!res) throw new Error("Anthropic request failed");
+
+  if (!res.ok) {
+    const body = lastBody || (await res.text().catch(() => ""));
+    throw new Error(`Anthropic error ${res.status}: ${body}`);
+  }
+
+  const acceptedOutputTokens = selectedTokenBudget ?? maxTokens;
+  params.onAcceptedOutputTokens?.(acceptedOutputTokens);
+  const acceptedThinkingBudget =
+    typeof thinkingBudget === "number"
+      ? Math.min(thinkingBudget, acceptedOutputTokens - 1)
+      : undefined;
+  params.onAcceptedRequestConfiguration?.({
+    apiMode: selectedBetaHeader ? `messages+${selectedBetaHeader}` : "messages",
+    maxOutputTokens: acceptedOutputTokens,
+    ...(typeof acceptedThinkingBudget === "number" && acceptedThinkingBudget >= 1024
+      ? { reasoningMaxTokens: acceptedThinkingBudget }
+      : {}),
+    thinkingMode: usesAdaptiveThinking
+      ? `adaptive_effort=${selectedAdaptiveEffort ?? "default"}`
+      : typeof acceptedThinkingBudget === "number" && acceptedThinkingBudget >= 1024
+        ? `thinking_budget=${acceptedThinkingBudget}`
+        : "default",
+    temperature: capabilities.defaultSamplingOnly
+      ? "default"
+      : usesAdaptiveThinking || typeof acceptedThinkingBudget === "number"
+        ? 1
+        : (params.temperature ?? 0.2),
+    textVerbosity: "default",
+    responseFormat:
+      useStructuredOutputs
+        ? structuredMode === "forced_tool"
+          ? "forced_tool"
+          : "json_schema"
+        : "text",
+  });
+
+  if (usesAdaptiveThinking && selectedAdaptiveEffort) {
+    params.onTrace?.(
+      withMaxOutputTokens(
+        `Anthropic reasoning effort in use: '${selectedAdaptiveEffort}'.`,
+        acceptedOutputTokens,
+      ),
+    );
+  }
+
+  if (didUseStreaming) {
+    let text = "";
+    await consumeSseStream(res, (evt) => {
+      if (evt.data === "[DONE]") return;
+      let parsed: AnthropicStreamEvent | null = null;
+      try {
+        parsed = JSON.parse(evt.data) as AnthropicStreamEvent;
+      } catch {
+        return;
+      }
+      // message streaming sends incremental deltas on content_block_delta
+      if (parsed?.type === "content_block_delta") {
+        const deltaObj = parsed.delta as { text?: unknown; partial_json?: unknown } | undefined;
+        const chunk =
+          deltaObj && typeof deltaObj.text === "string"
+            ? deltaObj.text
+            : deltaObj && typeof deltaObj.partial_json === "string"
+              ? deltaObj.partial_json
+              : "";
+        if (chunk) {
+          text += chunk;
+          params.onDelta?.(chunk);
+        }
+      }
+    });
+    return { text };
+  }
+
+  const data = (await res.json()) as AnthropicMessageResponse;
+  if (useStructuredOutputs && structuredMode === "forced_tool") {
+    const toolUse = data.content?.find(
+      (block) => block.type === "tool_use" && block.name === STRUCTURED_OUTPUT_TOOL_NAME,
+    );
+    if (toolUse && toolUse.input !== undefined) {
+      return { text: JSON.stringify(toolUse.input) };
+    }
+  }
+  const text =
+    data.content
+      ?.filter((c) => c.type === "text")
+      .map((c) => c.text ?? "")
+      .join("") ?? "";
+  return { text };
+}

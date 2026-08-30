@@ -1,0 +1,437 @@
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { CURATED_PROMPTS } from "@/lib/arena/curatedPrompts";
+import { MODEL_CATALOG, ModelKey } from "@/lib/ai/modelCatalog";
+import { generateVoxelBuild } from "@/lib/ai/generateVoxelBuild";
+import { createHash } from "node:crypto";
+import { maybePrecomputeArenaArtifactsForBuild } from "@/lib/arena/artifactMaintenance";
+import { invalidateArenaCoverageCache } from "@/lib/arena/coverage";
+import {
+  getCatalogSeedGenerationModelKeys,
+  isCatalogModelGeneratableForSeed,
+  modelCatalogSeedUpsertArgs,
+} from "@/lib/admin/seedModelCatalog";
+import { isLoopbackDatabaseUrl } from "@/lib/db/identity";
+
+export const runtime = "nodejs";
+
+function requireAdmin(req: Request): string | null {
+  const token = process.env.ADMIN_TOKEN;
+  if (!token) return "Missing ADMIN_TOKEN on server";
+
+  const auth = req.headers.get("authorization");
+  if (!auth) return "Missing Authorization header (expected: Authorization: Bearer <ADMIN_TOKEN>)";
+
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return "Invalid Authorization header (expected: Authorization: Bearer <ADMIN_TOKEN>)";
+  }
+
+  const presented = match[1]?.trim();
+  if (!presented) {
+    return "Empty Bearer token (did you set $ADMIN_TOKEN when running curl?)";
+  }
+  if (presented !== token.trim()) {
+    return "Invalid token (must match ADMIN_TOKEN; note Next.js dev loads .env.local before .env)";
+  }
+  return null;
+}
+
+function getDbInfo() {
+  const url = process.env.DATABASE_URL;
+  if (!url) return null;
+
+  try {
+    const u = new URL(url);
+    const database = u.pathname.replace(/^\//, "");
+    const pgbouncer = u.searchParams.get("pgbouncer") === "true";
+
+    return {
+      host: u.hostname,
+      port: u.port || "5432",
+      database,
+      pgbouncer,
+    };
+  } catch {
+    return { host: "unknown", port: "unknown", database: "unknown", pgbouncer: false };
+  }
+}
+
+function providerKeyStatus() {
+  return {
+    openai: Boolean(process.env.OPENAI_API_KEY),
+    anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+    gemini: Boolean(process.env.GOOGLE_AI_API_KEY),
+    moonshot: Boolean(process.env.MOONSHOT_API_KEY),
+    deepseek: Boolean(process.env.DEEPSEEK_API_KEY),
+    minimax: Boolean(process.env.MINIMAX_API_KEY),
+    xai: Boolean(process.env.XAI_API_KEY),
+    meta: Boolean(process.env.META_MODEL_API_KEY),
+    zai: Boolean(process.env.ZAI_API_KEY),
+    openrouter: Boolean(process.env.OPENROUTER_API_KEY),
+  };
+}
+
+function isModelGeneratable(args: { modelKey: string; provider: string }) {
+  const status = providerKeyStatus();
+  const catalog = MODEL_CATALOG.find((m) => m.key === args.modelKey);
+  if (catalog) {
+    return isCatalogModelGeneratableForSeed({ model: catalog, providerKeys: status });
+  }
+
+  if (args.provider === "xai") return status.xai;
+
+  if (args.provider === "openai") return status.openai;
+  if (args.provider === "anthropic") return status.anthropic;
+  if (args.provider === "gemini") return status.gemini;
+  if (args.provider === "moonshot") return status.moonshot;
+  if (args.provider === "deepseek") return status.deepseek;
+  if (args.provider === "minimax") return status.minimax;
+  if (args.provider === "meta") return status.meta;
+  if (args.provider === "zai") return status.zai;
+
+  // Unknown provider: assume it's callable (or OpenRouter-gated via catalog entries).
+  return true;
+}
+
+const ARENA_SETTINGS = {
+  gridSize: 256 as const,
+  palette: "simple" as const,
+  mode: "precise" as const,
+};
+
+const MAX_BATCH = 3;
+const FALSE_VALUES = new Set(["0", "false", "no"]);
+const TRUE_VALUES = new Set(["1", "true", "yes"]);
+
+export async function POST(req: Request) {
+  const denied = requireAdmin(req);
+  if (denied) return NextResponse.json({ error: denied }, { status: 401 });
+
+  const url = new URL(req.url);
+  const runId = crypto.randomUUID().slice(0, 8);
+  const dryRun = TRUE_VALUES.has((url.searchParams.get("dryRun") ?? "").trim().toLowerCase());
+  const generateBuilds = !FALSE_VALUES.has((url.searchParams.get("generateBuilds") ?? "").trim().toLowerCase());
+  const batchSizeRaw = Number(url.searchParams.get("batchSize") ?? "2");
+  const batchSize = Math.max(1, Math.min(MAX_BATCH, Number.isFinite(batchSizeRaw) ? batchSizeRaw : 2));
+  const keyStatus = providerKeyStatus();
+  const enableCatalogModels = isLoopbackDatabaseUrl(process.env.DATABASE_URL ?? "");
+
+  await prisma.$transaction(async (tx) => {
+    await tx.model.upsert({
+      where: { key: "baseline" },
+      create: {
+        key: "baseline",
+        provider: "baseline",
+        modelId: "baseline",
+        displayName: "Baseline",
+        enabled: false,
+        isBaseline: true,
+        eloRating: 1500,
+        glickoRd: 350,
+        glickoVolatility: 0.06,
+        conservativeRating: 800,
+      },
+      update: {},
+    });
+
+    for (const m of MODEL_CATALOG) {
+      await tx.model.upsert(modelCatalogSeedUpsertArgs(m, enableCatalogModels));
+    }
+
+    for (const text of CURATED_PROMPTS) {
+      await tx.prompt.upsert({
+        where: { text },
+        create: { text, active: true },
+        update: { active: true },
+      });
+    }
+  });
+  invalidateArenaCoverageCache();
+
+  // Active prompts outside the cohort stay untouched (imported custom prompts
+  // are legitimate) but get surfaced so cohort drift is visible
+  const curatedSet = new Set(CURATED_PROMPTS);
+  const activePrompts = await prisma.prompt.findMany({
+    where: { active: true },
+    select: { text: true },
+  });
+  const activePromptsOutsideCohort = activePrompts
+    .map((prompt) => prompt.text)
+    .filter((text) => !curatedSet.has(text));
+
+  if (!generateBuilds) {
+    const [promptCount, modelCount] = await Promise.all([
+      prisma.prompt.count({ where: { active: true } }),
+      prisma.model.count({ where: { enabled: true, isBaseline: false, stealthVariant: null } }),
+    ]);
+
+    return NextResponse.json({
+      ok: true,
+      done: true,
+      seeded: 0,
+      promptCount,
+      activePromptsOutsideCohort,
+      modelCount,
+      settings: ARENA_SETTINGS,
+      db: getDbInfo(),
+      providerKeys: keyStatus,
+      runId,
+    });
+  }
+
+  const prompts = await prisma.prompt.findMany({
+    where: { active: true },
+    orderBy: { createdAt: "asc" },
+  });
+
+  const modelsAll = await prisma.model.findMany({
+    where: {
+      key: { in: getCatalogSeedGenerationModelKeys(MODEL_CATALOG) },
+      isBaseline: false,
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  const modelsGeneratable = modelsAll.filter((m) => isModelGeneratable({ modelKey: m.key, provider: m.provider }));
+  const skippedModelKeys = modelsAll
+    .filter((m) => !isModelGeneratable({ modelKey: m.key, provider: m.provider }))
+    .map((m) => m.key);
+
+  if (prompts.length === 0) {
+    return NextResponse.json({
+      ok: false,
+      done: true,
+      seeded: 0,
+      error: "No active prompts found. Add prompts to CURATED_PROMPTS and rerun seed.",
+      promptCount: 0,
+      modelCount: modelsAll.length,
+      settings: ARENA_SETTINGS,
+      db: getDbInfo(),
+      providerKeys: keyStatus,
+      runId,
+    });
+  }
+
+  if (modelsAll.length === 0) {
+    return NextResponse.json({
+      ok: false,
+      done: true,
+      seeded: 0,
+      error:
+        "No enabled models found. Set at least one API key (OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_AI_API_KEY, MINIMAX_API_KEY, XAI_API_KEY, META_MODEL_API_KEY, ZAI_API_KEY, etc.) or enable models for configured providers.",
+      promptCount: prompts.length,
+      modelCount: 0,
+      settings: ARENA_SETTINGS,
+      db: getDbInfo(),
+      providerKeys: keyStatus,
+      runId,
+    });
+  }
+
+  const existing = await prisma.build.findMany({
+    where: {
+      gridSize: ARENA_SETTINGS.gridSize,
+      palette: ARENA_SETTINGS.palette,
+      mode: ARENA_SETTINGS.mode,
+      promptId: { in: prompts.map((p) => p.id) },
+      modelId: { in: modelsAll.map((m) => m.id) },
+    },
+    select: { promptId: true, modelId: true },
+  });
+
+  const existingSet = new Set(existing.map((b) => `${b.promptId}:${b.modelId}`));
+
+  const totalExpectedBuilds = prompts.length * modelsAll.length;
+  const existingBuilds = existingSet.size;
+  const remainingBefore = Math.max(0, totalExpectedBuilds - existingBuilds);
+
+  const generatableModelIds = new Set(modelsGeneratable.map((m) => m.id));
+  const existingGeneratableSet = new Set(
+    existing.filter((b) => generatableModelIds.has(b.modelId)).map((b) => `${b.promptId}:${b.modelId}`)
+  );
+  const totalExpectedBuildsGeneratable = prompts.length * modelsGeneratable.length;
+  const existingBuildsGeneratable = existingGeneratableSet.size;
+  const remainingBeforeGeneratable = Math.max(0, totalExpectedBuildsGeneratable - existingBuildsGeneratable);
+
+  if (dryRun) {
+    return NextResponse.json({
+      ok: true,
+      done: remainingBeforeGeneratable === 0,
+      seeded: 0,
+      promptCount: prompts.length,
+      modelCount: modelsAll.length,
+      modelCountGeneratable: modelsGeneratable.length,
+      totalExpectedBuilds,
+      existingBuilds,
+      remainingBuilds: remainingBefore,
+      totalExpectedBuildsGeneratable,
+      existingBuildsGeneratable,
+      remainingBuildsGeneratable: remainingBeforeGeneratable,
+      skippedModelKeys,
+      settings: ARENA_SETTINGS,
+      db: getDbInfo(),
+      providerKeys: keyStatus,
+      runId,
+    });
+  }
+
+  if (modelsGeneratable.length === 0) {
+    return NextResponse.json({
+      ok: false,
+      done: true,
+      seeded: 0,
+      error:
+        "No API keys are configured, so no builds can be generated automatically. Use generateBuilds=0 to seed prompts/models only, or set OPENROUTER_API_KEY or a direct provider key to generate builds.",
+      promptCount: prompts.length,
+      modelCount: modelsAll.length,
+      modelCountGeneratable: 0,
+      totalExpectedBuilds,
+      existingBuilds,
+      remainingBuilds: remainingBefore,
+      totalExpectedBuildsGeneratable,
+      existingBuildsGeneratable,
+      remainingBuildsGeneratable: remainingBeforeGeneratable,
+      skippedModelKeys,
+      settings: ARENA_SETTINGS,
+      db: getDbInfo(),
+      providerKeys: keyStatus,
+      runId,
+    });
+  }
+
+  const pending: { promptId: string; promptText: string; modelId: string; modelKey: ModelKey }[] = [];
+
+  for (const p of prompts) {
+    for (const m of modelsGeneratable) {
+      const key = `${p.id}:${m.id}`;
+      if (existingSet.has(key)) continue;
+      pending.push({ promptId: p.id, promptText: p.text, modelId: m.id, modelKey: m.key as ModelKey });
+      if (pending.length >= batchSize) break;
+    }
+    if (pending.length >= batchSize) break;
+  }
+
+  if (pending.length === 0) {
+    return NextResponse.json({
+      ok: true,
+      done: true,
+      seeded: 0,
+      promptCount: prompts.length,
+      modelCount: modelsAll.length,
+      modelCountGeneratable: modelsGeneratable.length,
+      totalExpectedBuilds,
+      existingBuilds,
+      remainingBuilds: remainingBefore,
+      totalExpectedBuildsGeneratable,
+      existingBuildsGeneratable,
+      remainingBuildsGeneratable: remainingBeforeGeneratable,
+      skippedModelKeys,
+      settings: ARENA_SETTINGS,
+      db: getDbInfo(),
+      providerKeys: keyStatus,
+      runId,
+    });
+  }
+
+  let seeded = 0;
+  const startedAt = Date.now();
+  console.log(`[seed:${runId}] starting batch (size=${pending.length}, remaining≈${remainingBefore})`);
+
+  const seededJobs: { promptId: string; modelKey: ModelKey }[] = [];
+  for (const [idx, job] of pending.entries()) {
+    console.log(
+      `[seed:${runId}] generating ${idx + 1}/${pending.length} model=${job.modelKey} promptId=${job.promptId}`
+    );
+
+    const r = await generateVoxelBuild({
+      modelKey: job.modelKey,
+      prompt: job.promptText,
+      gridSize: ARENA_SETTINGS.gridSize,
+      palette: ARENA_SETTINGS.palette,
+    });
+
+    if (!r.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: r.error,
+          modelKey: job.modelKey,
+          promptId: job.promptId,
+          prompt: job.promptText,
+          settings: ARENA_SETTINGS,
+          db: getDbInfo(),
+          providerKeys: keyStatus,
+          runId,
+        },
+        { status: 502 }
+      );
+    }
+
+    const buildJson = JSON.stringify(r.build);
+    const saved = await prisma.build.create({
+      data: {
+        promptId: job.promptId,
+        modelId: job.modelId,
+        gridSize: ARENA_SETTINGS.gridSize,
+        palette: ARENA_SETTINGS.palette,
+        mode: ARENA_SETTINGS.mode,
+        voxelData: r.build,
+        voxelByteSize: Buffer.byteLength(buildJson),
+        voxelSha256: createHash("sha256").update(buildJson).digest("hex"),
+        blockCount: r.blockCount,
+        generationTimeMs: r.generationTimeMs,
+      },
+    });
+
+    try {
+      await maybePrecomputeArenaArtifactsForBuild({
+        id: saved.id,
+        gridSize: saved.gridSize,
+        palette: saved.palette,
+        blockCount: saved.blockCount,
+        voxelByteSize: saved.voxelByteSize,
+        voxelCompressedByteSize: saved.voxelCompressedByteSize,
+        voxelSha256: saved.voxelSha256,
+        voxelData: saved.voxelData,
+        voxelStorageBucket: saved.voxelStorageBucket,
+        voxelStoragePath: saved.voxelStoragePath,
+        voxelStorageEncoding: saved.voxelStorageEncoding,
+      });
+    } catch (err) {
+      console.warn(`[seed:${runId}] artifact precompute skipped for build=${saved.id}`, err);
+    }
+
+    seeded += 1;
+    seededJobs.push({ promptId: job.promptId, modelKey: job.modelKey });
+  }
+
+  const durationMs = Date.now() - startedAt;
+  const remainingAfter = Math.max(0, remainingBefore - seeded);
+  const remainingAfterGeneratable = Math.max(0, remainingBeforeGeneratable - seeded);
+  console.log(`[seed:${runId}] batch complete (seeded=${seeded}, remaining≈${remainingAfter}, durationMs=${durationMs})`);
+  invalidateArenaCoverageCache();
+
+  return NextResponse.json({
+    ok: true,
+    done: false,
+    seeded,
+    promptCount: prompts.length,
+    modelCount: modelsAll.length,
+    modelCountGeneratable: modelsGeneratable.length,
+    totalExpectedBuilds,
+    existingBuilds,
+    remainingBuilds: remainingAfter,
+    totalExpectedBuildsGeneratable,
+    existingBuildsGeneratable,
+    remainingBuildsGeneratable: remainingAfterGeneratable,
+    skippedModelKeys,
+    seededJobs,
+    durationMs,
+    settings: ARENA_SETTINGS,
+    db: getDbInfo(),
+    providerKeys: keyStatus,
+    remainingEstimate: "Run again to continue seeding",
+    runId,
+  });
+}

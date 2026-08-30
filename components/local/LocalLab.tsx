@@ -1,0 +1,881 @@
+"use client";
+
+import { ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import { SandboxGifExportButton, type SandboxGifExportTarget } from "@/components/sandbox/SandboxGifExportButton";
+import { buildSystemPrompt, buildUserPrompt, buildWebPrompt } from "@/lib/ai/prompts";
+import { MAX_BLOCKS_BY_GRID, MIN_BLOCKS_BY_GRID } from "@/lib/ai/limits";
+import { extractBestVoxelBuildJson } from "@/lib/ai/jsonExtract";
+import { getPalette } from "@/lib/blocks/palettes";
+import { validateVoxelBuild } from "@/lib/voxel/validate";
+import type { VoxelBuild } from "@/lib/voxel/types";
+import { VoxelViewerCard } from "@/components/voxel/VoxelViewerCard";
+import type { VoxelViewerHandle } from "@/components/voxel/VoxelViewer";
+import { formatVoxelLoadingMessage } from "@/components/voxel/VoxelLoadingHud";
+
+type Palette = "simple" | "advanced";
+type GridSize = 64 | 256 | 512;
+
+type LocalParseWorkerRequest =
+  | {
+      type: "parse";
+      requestId: number;
+      rawText: string;
+      gridSize: GridSize;
+      palette: Palette;
+      maxBlocksByGrid: Record<GridSize, number>;
+    }
+  | {
+      type: "cancel";
+      requestId?: number;
+    };
+
+type LocalParseWorkerResponse =
+  | {
+      type: "progress";
+      requestId: number;
+      deltaBlocks: VoxelBuild["blocks"];
+      receivedBlocks: number;
+      totalBlocks: number | null;
+    }
+  | {
+      type: "complete";
+      requestId: number;
+      voxelBuild: VoxelBuild;
+      warnings: string[];
+      receivedBlocks: number;
+      totalBlocks: number | null;
+      source: "build-json" | "tool-call";
+      resolved: {
+        gridSize: GridSize;
+        palette: Palette;
+      };
+    }
+  | {
+      type: "error";
+      requestId: number;
+      message: string;
+    };
+
+function cx(...classes: Array<string | false | null | undefined>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+const LARGE_PASTE_CHAR_THRESHOLD = 2_500_000;
+
+function formatCompactCount(value: number): string {
+  return value.toLocaleString();
+}
+
+function formatApproxMbFromChars(chars: number): string {
+  const mb = chars / 1_000_000;
+  if (mb >= 100) return `${Math.round(mb)}MB`;
+  if (mb >= 10) return `${mb.toFixed(1)}MB`;
+  return `${mb.toFixed(2)}MB`;
+}
+
+function trimOuterWhitespace(text: string): string {
+  if (!text) return "";
+  let start = 0;
+  let end = text.length;
+  while (start < end && /\s/.test(text[start] ?? "")) start += 1;
+  while (end > start && /\s/.test(text[end - 1] ?? "")) end -= 1;
+  if (start === 0 && end === text.length) return text;
+  return text.slice(start, end);
+}
+
+function CopyButton({
+  label,
+  text,
+  disabled,
+  tone = "ghost",
+  icon,
+  className,
+  description,
+}: {
+  label: string;
+  text: string;
+  disabled?: boolean;
+  tone?: "ghost" | "primary";
+  icon?: ReactNode;
+  className?: string;
+  description?: string;
+}) {
+  const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");
+  const descriptionId = useId();
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("copied");
+      window.setTimeout(() => setStatus("idle"), 1100);
+    } catch {
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.setAttribute("readonly", "true");
+        el.style.position = "fixed";
+        el.style.left = "-9999px";
+        el.style.top = "0";
+        document.body.appendChild(el);
+        el.focus();
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        if (!ok) throw new Error("execCommand failed");
+        setStatus("copied");
+        window.setTimeout(() => setStatus("idle"), 1100);
+      } catch {
+        setStatus("error");
+        window.setTimeout(() => setStatus("idle"), 1400);
+      }
+    }
+  }
+
+  return (
+    <span className="group relative z-20 inline-flex">
+      <button
+        type="button"
+        aria-describedby={description ? descriptionId : undefined}
+        className={cx(
+          "mb-btn h-8 px-2.5 text-[11px] sm:h-9 sm:px-3 sm:text-xs",
+          tone === "primary" ? "mb-btn-primary" : "mb-btn-ghost",
+          className,
+        )}
+        disabled={disabled}
+        onClick={copy}
+      >
+        <span className="inline-flex items-center gap-1.5">
+          {icon}
+          <span>{status === "copied" ? "Copied" : status === "error" ? "Copy failed" : label}</span>
+        </span>
+      </button>
+      {description ? (
+        <span
+          id={descriptionId}
+          role="tooltip"
+          className="pointer-events-none invisible absolute bottom-[calc(100%+0.625rem)] right-0 z-50 w-64 rounded-md bg-card px-3 py-2.5 text-left text-[11px] leading-relaxed text-fg/90 opacity-0 shadow-2xl ring-1 ring-border transition-opacity after:absolute after:-bottom-1 after:right-8 after:h-2 after:w-2 after:rotate-45 after:border-b after:border-r after:border-border after:bg-card group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100 sm:w-72"
+        >
+          {description}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+function SegmentedControl({
+  value,
+  onChange,
+  options,
+  className,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: Array<{ value: string; label: ReactNode }>;
+  className?: string;
+}) {
+  const safeCount = Math.max(1, options.length);
+  const activeIndex = Math.max(
+    0,
+    options.findIndex((option) => option.value === value),
+  );
+  const segmentWidth = `${100 / safeCount}%`;
+  const segmentTranslate = `${activeIndex * 100}%`;
+
+  return (
+    <div
+      className={cx(
+        "relative flex rounded-md bg-bg/60 p-1 ring-1 ring-border",
+        className,
+      )}
+    >
+      <div className="pointer-events-none absolute inset-1 rounded-lg">
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-0 left-0 rounded-lg bg-accent/15 ring-1 ring-accent/40 transition-transform duration-200 ease-out"
+          style={{
+            width: segmentWidth,
+            transform: `translateX(${segmentTranslate})`,
+          }}
+        />
+      </div>
+      {options.map((option) => {
+        const active = option.value === value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            aria-pressed={active}
+            className={cx(
+              "relative z-10 flex h-9 min-w-0 flex-1 items-center justify-center rounded-lg px-3 text-sm font-semibold transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 sm:h-10",
+              active ? "text-fg" : "text-muted hover:text-fg",
+            )}
+            onClick={() => onChange(option.value)}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SegmentedField({
+  label,
+  hint,
+  className,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={cx("flex min-w-0 flex-col gap-2", className)}>
+      <div className="text-[0.64rem] font-semibold uppercase tracking-[0.32em] text-muted/72">{label}</div>
+      {children}
+      {hint ? <div className="text-xs text-muted/80">{hint}</div> : null}
+    </div>
+  );
+}
+
+export function LocalLab() {
+  const [gridSize, setGridSize] = useState<GridSize>(256);
+  const [palette, setPalette] = useState<Palette>("simple");
+
+  const defaultSystem = useMemo(() => {
+    const minBlocks = MIN_BLOCKS_BY_GRID[gridSize];
+    return buildSystemPrompt({
+      gridSize,
+      minBlocks,
+      maxBlocks: MAX_BLOCKS_BY_GRID[gridSize],
+      palette,
+    });
+  }, [gridSize, palette]);
+
+  const [systemPrompt, setSystemPrompt] = useState(() => defaultSystem);
+  const [systemIsDefault, setSystemIsDefault] = useState(true);
+
+  useEffect(() => {
+    if (!systemIsDefault) return;
+    setSystemPrompt(defaultSystem);
+  }, [defaultSystem, systemIsDefault]);
+
+  const [taskPrompt, setTaskPrompt] = useState(
+    "A warm wooden cabin beside a pond, with a stone chimney, a small dock, and a few trees.",
+  );
+  const userPrompt = useMemo(() => buildUserPrompt(taskPrompt.trim()), [taskPrompt]);
+
+  const apiPrompt = useMemo(() => {
+    return `SYSTEM:\n${systemPrompt}\n\nUSER:\n${userPrompt}`;
+  }, [systemPrompt, userPrompt]);
+  const webPrompt = useMemo(
+    () =>
+      buildWebPrompt({
+        gridSize,
+        minBlocks: MIN_BLOCKS_BY_GRID[gridSize],
+        maxBlocks: MAX_BLOCKS_BY_GRID[gridSize],
+        palette,
+        prompt: taskPrompt,
+      }),
+    [gridSize, palette, taskPrompt],
+  );
+
+  const modelOutputRef = useRef<HTMLTextAreaElement | null>(null);
+  const bufferedOutputRef = useRef<string | null>(null);
+  const [inputStats, setInputStats] = useState<{ mode: "empty" | "editor" | "buffered"; chars: number }>({
+    mode: "empty",
+    chars: 0,
+  });
+  const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [rendered, setRendered] = useState<{
+    kind: "idle" | "loading" | "ready" | "error";
+    build: VoxelBuild | null;
+    warnings: string[];
+    progress?: {
+      receivedBlocks: number;
+      totalBlocks: number | null;
+    };
+    message?: string;
+  }>({ kind: "idle", build: null, warnings: [] });
+  const previewViewerRef = useRef<VoxelViewerHandle | null>(null);
+  const parseWorkerRef = useRef<Worker | null>(null);
+  const parseRequestIdRef = useRef(0);
+  const streamedBlocksRef = useRef<VoxelBuild["blocks"]>([]);
+  const gridSizeRef = useRef<GridSize>(gridSize);
+  const paletteRef = useRef<Palette>(palette);
+
+  useEffect(() => {
+    gridSizeRef.current = gridSize;
+  }, [gridSize]);
+
+  useEffect(() => {
+    paletteRef.current = palette;
+  }, [palette]);
+
+  useEffect(() => {
+    const worker = new Worker(new URL("./localBuildParse.worker.ts", import.meta.url));
+    parseWorkerRef.current = worker;
+
+    const onMessage = (event: MessageEvent<LocalParseWorkerResponse>) => {
+      const message = event.data;
+      if (!message) return;
+
+      if (message.requestId !== parseRequestIdRef.current) return;
+
+      if (message.type === "progress") {
+        if (message.deltaBlocks.length > 0) {
+          streamedBlocksRef.current.push(...message.deltaBlocks);
+        }
+
+        setRendered({
+          kind: "loading",
+          build: {
+            version: "1.0",
+            blocks: streamedBlocksRef.current,
+          },
+          warnings: [],
+          progress: {
+            receivedBlocks: message.receivedBlocks,
+            totalBlocks: message.totalBlocks,
+          },
+        });
+        return;
+      }
+
+      if (message.type === "complete") {
+        if (message.resolved.gridSize !== gridSizeRef.current) {
+          setGridSize(message.resolved.gridSize);
+        }
+        if (message.resolved.palette !== paletteRef.current) {
+          setPalette(message.resolved.palette);
+        }
+        if (message.source === "tool-call") {
+          const switchedSettings =
+            message.resolved.gridSize !== gridSizeRef.current || message.resolved.palette !== paletteRef.current;
+          setStatusNote(
+            switchedSettings
+              ? `Detected a tool-call output. Switched to ${message.resolved.gridSize} / ${message.resolved.palette} to match.`
+              : "Detected a tool-call output and rendered it.",
+          );
+        } else {
+          setStatusNote(null);
+        }
+
+        setRendered({
+          kind: "ready",
+          build: message.voxelBuild,
+          warnings: message.warnings,
+          progress: {
+            receivedBlocks: message.receivedBlocks,
+            totalBlocks: message.totalBlocks,
+          },
+        });
+        return;
+      }
+
+      if (message.type === "error") {
+        setStatusNote(null);
+        setRendered({
+          kind: "error",
+          build: null,
+          warnings: [],
+          message: message.message,
+        });
+      }
+    };
+
+    worker.addEventListener("message", onMessage);
+
+    return () => {
+      worker.removeEventListener("message", onMessage);
+      try {
+        worker.postMessage({ type: "cancel" } satisfies LocalParseWorkerRequest);
+      } catch {
+        // ignore
+      }
+      worker.terminate();
+      if (parseWorkerRef.current === worker) parseWorkerRef.current = null;
+    };
+  }, []);
+
+  const previewExportTargets: SandboxGifExportTarget[] = useMemo(() => {
+    if (rendered.kind !== "ready" || !rendered.build) return [];
+    return [
+      {
+        viewerRef: previewViewerRef,
+        modelName: "Local Preview",
+        company: "MineBench",
+        blockCount: rendered.build.blocks.length,
+      },
+    ];
+  }, [rendered]);
+
+  const hasInput = inputStats.mode === "buffered" || inputStats.chars > 0;
+
+  function readActiveInputText() {
+    if (typeof bufferedOutputRef.current === "string") return bufferedOutputRef.current;
+    return modelOutputRef.current?.value ?? "";
+  }
+
+  function clearModelInput() {
+    bufferedOutputRef.current = null;
+    if (modelOutputRef.current) modelOutputRef.current.value = "";
+    setInputStats({ mode: "empty", chars: 0 });
+    setStatusNote(null);
+  }
+
+  async function loadJsonFile(file: File) {
+    if (!file.name.toLowerCase().endsWith(".json") && file.type !== "application/json") {
+      setStatusNote("Drop a JSON file.");
+      return;
+    }
+
+    try {
+      const text = await file.text();
+      if (!trimOuterWhitespace(text)) {
+        setStatusNote(`${file.name} is empty.`);
+        return;
+      }
+
+      const buffered = text.length >= LARGE_PASTE_CHAR_THRESHOLD;
+      bufferedOutputRef.current = buffered ? text : null;
+      if (modelOutputRef.current) modelOutputRef.current.value = buffered ? "" : text;
+      setInputStats({ mode: buffered ? "buffered" : "editor", chars: text.length });
+      setStatusNote(`${file.name} ready.`);
+    } catch {
+      setStatusNote(`Couldn't read ${file.name}.`);
+    }
+  }
+
+  function renderFromText(text: string) {
+    const trimmed = trimOuterWhitespace(text);
+    if (!trimmed) {
+      setStatusNote(null);
+      setRendered({
+        kind: "error",
+        build: null,
+        warnings: [],
+        message: "Paste a JSON object first.",
+      });
+      return;
+    }
+
+    const fallbackSync = () => {
+      let json: unknown = null;
+      try {
+        json = JSON.parse(trimmed) as unknown;
+      } catch {
+        json = extractBestVoxelBuildJson(trimmed);
+      }
+
+      if (!json) {
+        setStatusNote(null);
+        setRendered({
+          kind: "error",
+          build: null,
+          warnings: [],
+          message: "Couldn't find a valid JSON object. Paste just the raw JSON — no extra text.",
+        });
+        return;
+      }
+
+      const paletteDefs = getPalette(palette);
+      const validated = validateVoxelBuild(json, {
+        gridSize,
+        palette: paletteDefs,
+        maxBlocks: MAX_BLOCKS_BY_GRID[gridSize],
+      });
+
+      if (!validated.ok) {
+        setStatusNote(null);
+        setRendered({ kind: "error", build: null, warnings: [], message: validated.error });
+        return;
+      }
+
+      setStatusNote(null);
+      setRendered({
+        kind: "ready",
+        build: validated.value.build,
+        warnings: validated.value.warnings,
+        progress: {
+          receivedBlocks: validated.value.build.blocks.length,
+          totalBlocks: validated.value.build.blocks.length,
+        },
+      });
+    };
+
+    const worker = parseWorkerRef.current;
+    if (!worker) {
+      fallbackSync();
+      return;
+    }
+
+    setStatusNote(null);
+    const currentRequestId = parseRequestIdRef.current;
+    if (currentRequestId > 0) {
+      try {
+        worker.postMessage({ type: "cancel", requestId: currentRequestId } satisfies LocalParseWorkerRequest);
+      } catch {
+        // ignore
+      }
+    }
+
+    const requestId = ++parseRequestIdRef.current;
+    streamedBlocksRef.current = [];
+    setRendered({
+      kind: "loading",
+      build: null,
+      warnings: [],
+      progress: { receivedBlocks: 0, totalBlocks: null },
+    });
+
+    try {
+      worker.postMessage({
+        type: "parse",
+        requestId,
+        rawText: trimmed,
+        gridSize,
+        palette,
+        maxBlocksByGrid: MAX_BLOCKS_BY_GRID,
+      } satisfies LocalParseWorkerRequest);
+    } catch {
+      fallbackSync();
+    }
+  }
+
+  function renderFromInput() {
+    renderFromText(readActiveInputText());
+  }
+
+  const loadingMessage =
+    rendered.kind === "loading"
+      ? formatVoxelLoadingMessage("Retrieving build", rendered.progress)
+      : undefined;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="mb-panel p-4 sm:p-5">
+        <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
+            <div className="font-display text-[1.85rem] font-semibold tracking-tight text-fg sm:text-[2.1rem]">
+              Import a build
+            </div>
+            <div className="mt-1 text-sm text-muted">
+              Run the prompt anywhere, then import the result here.
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-start gap-x-5 gap-y-3 lg:justify-end">
+            <SegmentedField
+              label="Grid size"
+              hint="Larger grids allow more detail."
+              className="min-w-[220px] flex-1 sm:min-w-[240px]"
+            >
+              <SegmentedControl
+                value={String(gridSize)}
+                onChange={(value) => setGridSize(Number(value) as GridSize)}
+                options={[
+                  {
+                    value: "64",
+                    label: (
+                      <span className="inline-flex items-start">
+                        <span>64</span>
+                        <span className="relative -top-[0.38em] ml-px text-[0.58em] font-semibold opacity-90">3</span>
+                      </span>
+                    ),
+                  },
+                  {
+                    value: "256",
+                    label: (
+                      <span className="inline-flex items-start">
+                        <span>256</span>
+                        <span className="relative -top-[0.38em] ml-px text-[0.58em] font-semibold opacity-90">3</span>
+                      </span>
+                    ),
+                  },
+                  {
+                    value: "512",
+                    label: (
+                      <span className="inline-flex items-start">
+                        <span>512</span>
+                        <span className="relative -top-[0.38em] ml-px text-[0.58em] font-semibold opacity-90">3</span>
+                      </span>
+                    ),
+                  },
+                ]}
+              />
+            </SegmentedField>
+            <SegmentedField
+              label="Block palette"
+              hint="Advanced unlocks a wider block set."
+              className="min-w-[210px] flex-1 sm:min-w-[230px]"
+            >
+              <SegmentedControl
+                value={palette}
+                onChange={(value) => setPalette(value as Palette)}
+                options={[
+                  { value: "simple", label: "Simple" },
+                  { value: "advanced", label: "Advanced" },
+                ]}
+              />
+            </SegmentedField>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
+        <div className="mb-panel flex h-full flex-col">
+          <div className="flex flex-1 flex-col p-4 sm:p-5">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-fg">System prompt</div>
+                <div className="text-xs text-muted">
+                  Adjust it to see how models respond when different qualities are emphasized.
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <CopyButton
+                  label="Copy system"
+                  text={systemPrompt}
+                  tone="ghost"
+                  icon={
+                    <svg aria-hidden="true" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                      <rect x="8" y="8" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.8" />
+                      <rect x="5" y="5" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.8" />
+                    </svg>
+                  }
+                />
+                <button
+                  type="button"
+                  className="mb-btn mb-btn-ghost h-8 px-2.5 text-[11px] sm:h-9 sm:px-3 sm:text-xs"
+                  disabled={systemIsDefault}
+                  onClick={() => {
+                    setSystemPrompt(defaultSystem);
+                    setSystemIsDefault(true);
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              aria-label="System prompt"
+              className="mb-field mb-prompt-scroll mt-3 min-h-[178px] flex-1 font-mono text-[12px] leading-snug"
+              value={systemPrompt}
+              spellCheck={false}
+              onChange={(e) => {
+                setSystemIsDefault(false);
+                setSystemPrompt(e.target.value);
+              }}
+            />
+          </div>
+
+          <div className="border-t border-border/70" />
+
+          <div className="p-4 sm:p-5">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-fg">User prompt</div>
+                <div className="text-xs text-muted">What you want the model to build.</div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <CopyButton
+                  label="Copy for API"
+                  text={apiPrompt}
+                  disabled={!taskPrompt.trim()}
+                  icon={
+                    <svg aria-hidden="true" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                      <rect x="8" y="8" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.8" />
+                      <rect x="5" y="5" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.8" />
+                    </svg>
+                  }
+                />
+                <CopyButton
+                  label="Copy for web"
+                  text={webPrompt}
+                  disabled={!taskPrompt.trim()}
+                  tone="primary"
+                  description="Optimized for the web harness. It asks the model to create a downloadable JSON file you can import here."
+                  icon={
+                    <svg aria-hidden="true" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                      <path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z" stroke="currentColor" strokeWidth="1.8" />
+                      <path d="M3 12h18M12 3c2.4 2.45 3.6 5.45 3.6 9S14.4 18.55 12 21c-2.4-2.45-3.6-5.45-3.6-9S9.6 5.45 12 3Z" stroke="currentColor" strokeWidth="1.8" />
+                    </svg>
+                  }
+                />
+              </div>
+            </div>
+
+            <input
+              aria-label="User prompt — what to build"
+              className="mb-field mt-3 h-10"
+              value={taskPrompt}
+              onChange={(e) => setTaskPrompt(e.target.value)}
+              placeholder="Describe the build..."
+            />
+            <div className="mt-2 min-h-[142px] rounded-md border border-border/70 bg-bg/40 p-3 font-mono text-[12px] leading-snug text-muted">
+              {taskPrompt.trim() ? (
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap">{userPrompt}</pre>
+              ) : (
+                <div className="text-muted">Describe the build above to see the full message.</div>
+              )}
+            </div>
+
+          </div>
+        </div>
+
+        <div className="flex h-full flex-col gap-4">
+          <div className="mb-panel flex flex-col gap-3 p-4 sm:p-5">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-fg">Import JSON</div>
+                <div className="text-xs text-muted">Paste or drop a JSON file.</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  className="mb-btn mb-btn-ghost h-8 px-3 text-xs sm:h-9 sm:px-4"
+                  onClick={clearModelInput}
+                  disabled={!hasInput}
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  className="mb-btn mb-btn-primary h-8 px-3 text-xs sm:h-9 sm:px-4"
+                  onClick={renderFromInput}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none">
+                      <path d="m6 4 12 8-12 8V4Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+                    </svg>
+                    <span>Render</span>
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              ref={modelOutputRef}
+              aria-label="Paste model JSON output"
+              className={cx(
+                "mb-field mb-prompt-scroll min-h-[150px] flex-1 font-mono text-[12px] leading-snug",
+                isDraggingFile ? "border-accent ring-2 ring-accent/20" : "",
+              )}
+              placeholder='{"version":"1.0","boxes":[],"lines":[],"blocks":[{"x":0,"y":0,"z":0,"type":"stone"}]}'
+              spellCheck={false}
+              onDragEnter={(e) => {
+                if (!e.dataTransfer.types.includes("Files")) return;
+                e.preventDefault();
+                setIsDraggingFile(true);
+              }}
+              onDragOver={(e) => {
+                if (!e.dataTransfer.types.includes("Files")) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+                setIsDraggingFile(true);
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(false);
+                const file = e.dataTransfer.files[0];
+                if (file) void loadJsonFile(file);
+              }}
+              onPaste={(e) => {
+                const pasted = e.clipboardData?.getData("text") ?? "";
+                if (!pasted || pasted.length < LARGE_PASTE_CHAR_THRESHOLD) return;
+
+                e.preventDefault();
+                bufferedOutputRef.current = pasted;
+                if (modelOutputRef.current) modelOutputRef.current.value = "";
+                setInputStats({ mode: "buffered", chars: pasted.length });
+                setStatusNote(
+                  `Large paste ready (~${formatApproxMbFromChars(pasted.length)}).`,
+                );
+              }}
+              onChange={(e) => {
+                if (bufferedOutputRef.current != null) {
+                  bufferedOutputRef.current = null;
+                }
+                const chars = e.target.value.length;
+                setInputStats({ mode: chars > 0 ? "editor" : "empty", chars });
+              }}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                  e.preventDefault();
+                  renderFromInput();
+                }
+              }}
+            />
+
+            {inputStats.mode !== "empty" ? (
+              <div className="text-[11px] text-muted">
+                {formatCompactCount(inputStats.chars)} chars (~{formatApproxMbFromChars(inputStats.chars)})
+                {inputStats.mode === "buffered" ? " held in memory" : ""}
+              </div>
+            ) : null}
+
+            {rendered.kind === "error" && rendered.message ? (
+              <div className="mb-subpanel p-3 text-sm text-danger">{rendered.message}</div>
+            ) : statusNote ? (
+              <div className="mb-subpanel p-3 text-xs text-muted">{statusNote}</div>
+            ) : null}
+
+            {rendered.kind === "ready" && rendered.warnings.length ? (
+              <div className="mb-subpanel p-3 text-xs text-muted">
+                <div className="font-semibold text-fg">
+                  Rendered with {rendered.warnings.length} warning
+                  {rendered.warnings.length === 1 ? "" : "s"}.
+                </div>
+                <ul className="mt-1.5 list-disc space-y-1 pl-4">
+                  {rendered.warnings.slice(0, 4).map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                  {rendered.warnings.length > 4 ? <li>...and {rendered.warnings.length - 4} more</li> : null}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+
+          <VoxelViewerCard
+            title="Preview"
+            voxelBuild={
+              rendered.kind === "ready" || rendered.kind === "loading" ? rendered.build : null
+            }
+            gridSize={gridSize}
+            palette={palette}
+            autoRotate
+            isLoading={rendered.kind === "loading"}
+            loadingMessage={loadingMessage}
+            loadingProgress={rendered.kind === "loading" ? rendered.progress ?? undefined : undefined}
+            skipValidation={rendered.kind === "loading"}
+            viewerRef={previewViewerRef}
+            actions={
+              <SandboxGifExportButton
+                targets={previewExportTargets}
+                promptText={taskPrompt}
+                label="Export GIF"
+                iconOnly
+                embedded
+                className="h-8 w-8"
+              />
+            }
+            metrics={
+              rendered.kind === "ready" || rendered.kind === "loading"
+                ? {
+                    blockCount:
+                      rendered.progress?.receivedBlocks ?? rendered.build?.blocks.length ?? 0,
+                    warnings: rendered.warnings,
+                  }
+                : undefined
+            }
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
