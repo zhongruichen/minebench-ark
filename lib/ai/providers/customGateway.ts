@@ -44,6 +44,7 @@ import {
   type ResolvedCustomApiTarget,
 } from "@/lib/ai/providers/customApiGuard";
 import { extractChatCompletionText, withMaxOutputTokens } from "@/lib/ai/providers/shared";
+import { resolveOutboundUserAgent } from "@/lib/ai/userAgent";
 import type { ProviderTelemetryCallbacks } from "@/lib/ai/types";
 import http from "node:http";
 import https from "node:https";
@@ -205,13 +206,13 @@ function postJson(params: {
         ? 443
         : 80;
 
-    // Header order/name-casing mirrors the reference client (Kelivo).
+// Header order/name-casing mirrors the reference CLI client.
     const headers: Record<string, string> = {
       Authorization: `Bearer ${params.apiKey}`,
       "Content-Type": "application/json",
       Accept: params.stream ? "text/event-stream" : "application/json",
       "X-Conversation-Id": params.conversationId ?? randomUUID(),
-      "User-Agent": params.userAgent ?? "Kelivo",
+      "User-Agent": resolveOutboundUserAgent(params.userAgent),
       Host: params.target.url.host,
       "Content-Length": Buffer.byteLength(params.body).toString(),
       ...(params.extraHeaders ?? {}),

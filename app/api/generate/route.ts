@@ -4,6 +4,9 @@ import { waitUntil } from "@vercel/functions";
 import { generateVoxelBuild } from "@/lib/ai/generateVoxelBuild";
 import { getModelByKey, ModelKey } from "@/lib/ai/modelCatalog";
 import { assertSafeCustomApiUrl } from "@/lib/ai/providers/customApiGuard";
+import { providerConfigSchema } from "@/lib/ai/providerConfigSchema";
+import type { ProviderConfig } from "@/lib/ai/providerConfig";
+import type { ProviderExchangeLog } from "@/lib/ai/providerExchangeLog";
 import type { GenerateEvent, GenerateModelRequest, GenerateRequest } from "@/lib/ai/types";
 import { publishGenerationError, publishGenerationSuccess } from "@/lib/observability/cloudwatch";
 
@@ -33,6 +36,12 @@ const modelRequestSchema = z.union([
   }),
   z.object({
     id: z.string().trim().min(1).max(200),
+    kind: z.literal("configured"),
+    providerId: z.string().trim().min(1).max(200),
+    modelConfigId: z.string().trim().min(1).max(200),
+  }),
+  z.object({
+    id: z.string().trim().min(1).max(200),
     kind: z.literal("custom"),
     provider: z.literal("custom"),
     displayName: z.string().trim().min(1).max(120),
@@ -44,7 +53,7 @@ const modelRequestSchema = z.union([
       .enum(["low", "medium", "high", "xhigh", "max", "none"])
       .optional(),
     conversationId: z.string().trim().min(1).max(200).optional(),
-    userAgent: z.string().trim().min(1).max(200).optional(),
+    userAgent: z.string().trim().min(1).max(400).optional(),
   }),
   z.object({
     id: z.string().trim().min(1).max(200),
@@ -60,8 +69,13 @@ const reqSchema = z.object({
   gridSize: z.union([z.literal(64), z.literal(256), z.literal(512)]),
   palette: z.union([z.literal("simple"), z.literal("advanced")]),
   modelKeys: z.array(z.string()).min(1).max(8).optional(),
-  models: z.array(modelRequestSchema).min(1).max(8).optional(),
+  // Battle mode compares many models on one prompt, so the ceiling is higher
+  // than the original 8. Concurrency is still bounded by the provider itself.
+  models: z.array(modelRequestSchema).min(1).max(16).optional(),
   providerKeys: providerKeysSchema,
+  providerConfigs: z.array(providerConfigSchema).max(16).optional(),
+  /** Emit `exchange` events with full request/response bodies. */
+  includeExchangeLog: z.boolean().optional(),
 }).superRefine((value, ctx) => {
   if ((!value.models || value.models.length === 0) && (!value.modelKeys || value.modelKeys.length === 0)) {
     ctx.addIssue({
@@ -69,6 +83,34 @@ const reqSchema = z.object({
       message: "Provide at least one model.",
       path: ["models"],
     });
+  }
+
+  // A `configured` model request is meaningless without the config it names, so
+  // fail loudly at the edge rather than producing a confusing per-model error.
+  const configured = (value.models ?? []).filter(
+    (model): model is Extract<typeof model, { kind: "configured" }> =>
+      model.kind === "configured",
+  );
+  if (configured.length === 0) return;
+
+  const byId = new Map((value.providerConfigs ?? []).map((config) => [config.id, config]));
+  for (const model of configured) {
+    const provider = byId.get(model.providerId);
+    if (!provider) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unknown providerId '${model.providerId}'.`,
+        path: ["providerConfigs"],
+      });
+      continue;
+    }
+    if (!provider.models.some((candidate) => candidate.id === model.modelConfigId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Provider '${provider.label}' has no model '${model.modelConfigId}'.`,
+        path: ["providerConfigs"],
+      });
+    }
   }
 });
 
@@ -132,10 +174,48 @@ export async function POST(req: Request) {
     }
   }
 
+  // Configured providers get the same SSRF treatment, validated per endpoint
+  // kind so the exact URL that will be requested is the one that was checked.
+  const providerConfigs = new Map<string, ProviderConfig>(
+    (parsed.data.providerConfigs ?? []).map((config) => [config.id, config as ProviderConfig]),
+  );
+  const referencedProviderIds = new Set(
+    models.flatMap((model) => (model.kind === "configured" ? [model.providerId] : [])),
+  );
+  for (const providerId of referencedProviderIds) {
+    const provider = providerConfigs.get(providerId);
+    if (!provider) continue;
+    try {
+      await assertSafeCustomApiUrl(provider.baseUrl, {
+        endpoint:
+          provider.apiKind === "anthropic"
+            ? "messages"
+            : provider.apiKind === "openai_responses"
+              ? "responses"
+              : "chat_completions",
+        appendV1: provider.appendV1,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Invalid provider API server URL";
+      return NextResponse.json(
+        { error: `Provider '${provider.label}': ${message}` },
+        { status: 400 },
+      );
+    }
+  }
+
   const providerKeys = body.providerKeys;
   const allowServerKeys =
     process.env.NODE_ENV !== "production" || process.env.MINEBENCH_ALLOW_SERVER_KEYS === "1";
-  if (!allowServerKeys && (!providerKeys || Object.values(providerKeys).every((v) => !v))) {
+  // A configured provider carries its own credentials (or deliberately none),
+  // so it satisfies the "bring a key" requirement on its own.
+  const hasConfiguredProvider = referencedProviderIds.size > 0;
+  if (
+    !allowServerKeys &&
+    !hasConfiguredProvider &&
+    (!providerKeys || Object.values(providerKeys).every((v) => !v))
+  ) {
     return NextResponse.json(
       {
         error: "Add an OpenRouter or provider API key in Generate settings.",
@@ -145,6 +225,7 @@ export async function POST(req: Request) {
   }
 
   const debugRaw = process.env.AI_DEBUG === "1";
+  const includeExchangeLog = parsed.data.includeExchangeLog === true;
   const RAW_TEXT_MAX = 200_000;
 
   const encoder = new TextEncoder();
@@ -200,78 +281,127 @@ export async function POST(req: Request) {
       // A larger first chunk helps avoid proxy buffering so the client receives events immediately.
       send({ type: "hello", ts: Date.now(), pad: STREAM_PAD });
 
+      // Shared per-model event wiring. Extracted because there are now three
+      // model kinds (catalog / configured / custom) and inlining a third branch
+      // into a nested ternary made the call site unreadable.
+      const streamCallbacks = (requestModelKey: string) => ({
+        abortSignal: req.signal,
+        onRetry: (attempt: number, reason: string) =>
+          send({ type: "retry", modelKey: requestModelKey, attempt, reason }),
+        onDelta: (delta: string) => send({ type: "delta", modelKey: requestModelKey, delta }),
+        onReasoningDelta: (delta: string) =>
+          send({ type: "reasoning", modelKey: requestModelKey, delta }),
+        onProviderTrace: (message: string) =>
+          send({ type: "trace", modelKey: requestModelKey, message }),
+        onUsage: (usage: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+          prompt_tokens_details?: { cached_tokens?: number } | null;
+          completion_tokens_details?: { reasoning_tokens?: number } | null;
+        }) =>
+          send({
+            type: "usage",
+            modelKey: requestModelKey,
+            usage: {
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              totalTokens: usage.total_tokens,
+              reasoningTokens: usage.completion_tokens_details?.reasoning_tokens,
+              cachedTokens: usage.prompt_tokens_details?.cached_tokens,
+            },
+          }),
+        ...(includeExchangeLog
+          ? {
+              onExchange: (exchange: ProviderExchangeLog) =>
+                send({ type: "exchange", modelKey: requestModelKey, exchange }),
+            }
+          : {}),
+      });
+
+      const paramsForModel = (
+        model: GenerateModelRequest,
+        requestModelKey: string,
+      ): Parameters<typeof generateVoxelBuild>[0] => {
+        if (model.kind === "catalog") {
+          return {
+            modelKey: model.modelKey,
+            prompt: body.prompt,
+            gridSize: body.gridSize,
+            palette: body.palette,
+            maxAttempts: 2,
+            providerKeys,
+            allowServerKeys,
+            abortSignal: req.signal,
+            onRetry: (attempt, reason) =>
+              send({ type: "retry", modelKey: requestModelKey, attempt, reason }),
+            onDelta: (delta) => send({ type: "delta", modelKey: requestModelKey, delta }),
+          };
+        }
+
+        if (model.kind === "configured") {
+          // Presence was already enforced by the schema's superRefine.
+          const provider = providerConfigs.get(model.providerId)!;
+          const modelConfig = provider.models.find(
+            (candidate) => candidate.id === model.modelConfigId,
+          )!;
+          return {
+            model: {
+              key: model.id,
+              provider: "custom",
+              modelId: modelConfig.modelId,
+              displayName: modelConfig.displayName?.trim() || modelConfig.modelId,
+              configured: { provider, model: modelConfig },
+            },
+            prompt: body.prompt,
+            gridSize: body.gridSize,
+            palette: body.palette,
+            maxAttempts: 2,
+            providerKeys,
+            allowServerKeys,
+            ...streamCallbacks(requestModelKey),
+          };
+        }
+
+        return {
+          model:
+            model.provider === "openrouter"
+              ? {
+                  key: model.id,
+                  provider: "custom",
+                  modelId: model.modelId,
+                  displayName: model.displayName,
+                  openRouterModelId: model.modelId,
+                  forceOpenRouter: true,
+                }
+              : {
+                  key: model.id,
+                  provider: "custom",
+                  modelId: model.modelId,
+                  displayName: model.displayName,
+                  baseUrl: model.baseUrl,
+                  customGatewayMode: model.customGatewayMode,
+                  customGatewayStructuredOutput: model.customGatewayStructuredOutput,
+                  conversationId: model.conversationId,
+                  userAgent: model.userAgent,
+                },
+          prompt: body.prompt,
+          gridSize: body.gridSize,
+          palette: body.palette,
+          maxAttempts: 2,
+          providerKeys,
+          allowServerKeys,
+          reasoning: model.provider === "custom" ? model.reasoningEffort : undefined,
+          ...streamCallbacks(requestModelKey),
+        };
+      };
+
       let pending = models.length;
       for (const model of models) {
         const requestModelKey = model.id;
         send({ type: "start", modelKey: requestModelKey });
 
-        void generateVoxelBuild(
-          model.kind === "catalog"
-            ? {
-                modelKey: model.modelKey,
-                prompt: body.prompt,
-                gridSize: body.gridSize,
-                palette: body.palette,
-                maxAttempts: 2,
-                providerKeys,
-                allowServerKeys,
-                abortSignal: req.signal,
-                onRetry: (attempt, reason) =>
-                  send({ type: "retry", modelKey: requestModelKey, attempt, reason }),
-                onDelta: (delta) => send({ type: "delta", modelKey: requestModelKey, delta }),
-              }
-            : {
-                model:
-                  model.provider === "openrouter"
-                    ? {
-                        key: model.id,
-                        provider: "custom",
-                        modelId: model.modelId,
-                        displayName: model.displayName,
-                        openRouterModelId: model.modelId,
-                        forceOpenRouter: true,
-                      }
-                    : {
-                        key: model.id,
-                        provider: "custom",
-                        modelId: model.modelId,
-                        displayName: model.displayName,
-                        baseUrl: model.baseUrl,
-                        customGatewayMode: model.customGatewayMode,
-                        customGatewayStructuredOutput: model.customGatewayStructuredOutput,
-                        conversationId: model.conversationId,
-                        userAgent: model.userAgent,
-                      },
-                prompt: body.prompt,
-                gridSize: body.gridSize,
-                palette: body.palette,
-                maxAttempts: 2,
-                providerKeys,
-                allowServerKeys,
-                reasoning:
-                  model.provider === "custom" ? model.reasoningEffort : undefined,
-                abortSignal: req.signal,
-                onRetry: (attempt, reason) =>
-                  send({ type: "retry", modelKey: requestModelKey, attempt, reason }),
-                onDelta: (delta) => send({ type: "delta", modelKey: requestModelKey, delta }),
-                onReasoningDelta: (delta) =>
-                  send({ type: "reasoning", modelKey: requestModelKey, delta }),
-                onProviderTrace: (message) =>
-                  send({ type: "trace", modelKey: requestModelKey, message }),
-                onUsage: (usage) =>
-                  send({
-                    type: "usage",
-                    modelKey: requestModelKey,
-                    usage: {
-                      promptTokens: usage.prompt_tokens,
-                      completionTokens: usage.completion_tokens,
-                      totalTokens: usage.total_tokens,
-                      reasoningTokens: usage.completion_tokens_details?.reasoning_tokens,
-                      cachedTokens: usage.prompt_tokens_details?.cached_tokens,
-                    },
-                  }),
-              },
-        )
+        void generateVoxelBuild(paramsForModel(model, requestModelKey))
           .then((r) => {
             if (r.ok) {
               waitUntil(publishGenerationSuccess({

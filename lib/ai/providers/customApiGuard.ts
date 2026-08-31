@@ -47,6 +47,70 @@ function buildExactChatCompletionsUrl(raw?: string): URL {
   return new URL(base.endsWith("/chat/completions") ? base : `${base}/chat/completions`);
 }
 
+/**
+ * Endpoint kinds a configured provider can be asked to resolve. Kept as a
+ * closed union so a typo cannot silently produce a request to an unintended
+ * path on the operator's gateway.
+ */
+export type ProviderEndpointKind =
+  | "chat_completions"
+  | "responses"
+  | "messages"
+  | "models";
+
+const ENDPOINT_SUFFIX: Record<ProviderEndpointKind, string> = {
+  chat_completions: "/chat/completions",
+  responses: "/responses",
+  messages: "/messages",
+  models: "/models",
+};
+
+/**
+ * Builds the endpoint URL for a configured provider.
+ *
+ * `appendV1` is the operator's explicit switch, not a guess: some gateways
+ * publish `https://host/v1` (already versioned), some publish `https://host`
+ * and expect `/v1` to be added, and some publish a non-standard prefix such as
+ * `/api/plan/v3` where injecting `/v1` yields a 404. Guessing from the URL
+ * shape is what broke the original `custom` channel, so the decision is
+ * surfaced in the UI and honoured verbatim here.
+ *
+ * If the base URL already ends in the requested endpoint suffix, it is treated
+ * as a fully-qualified endpoint and returned as-is (after the `/v1` decision is
+ * applied to the remaining prefix), so pasting a complete chat-completions URL
+ * keeps working.
+ */
+export function buildProviderEndpointUrl(params: {
+  baseUrl: string;
+  endpoint: ProviderEndpointKind;
+  appendV1: boolean;
+}): URL {
+  const raw = params.baseUrl?.trim().replace(/\/+$/, "");
+  if (!raw) throw new Error("Missing custom API server URL");
+
+  const suffix = ENDPOINT_SUFFIX[params.endpoint];
+
+  // Already a fully-qualified endpoint of the requested kind: keep it verbatim.
+  // Appending `/v1` after the endpoint would be nonsense, so only the prefix is
+  // considered and it is by definition already what the operator wants.
+  if (raw.toLowerCase().endsWith(suffix)) return new URL(raw);
+
+  // A base URL carrying a DIFFERENT known endpoint suffix (e.g. someone pasted
+  // `/chat/completions` but we now need `/models`) is rebased onto its parent.
+  let base = raw;
+  for (const knownSuffix of Object.values(ENDPOINT_SUFFIX)) {
+    if (base.toLowerCase().endsWith(knownSuffix)) {
+      base = base.slice(0, -knownSuffix.length);
+      break;
+    }
+  }
+  base = base.replace(/\/+$/, "");
+  if (!base) throw new Error("Missing custom API server URL");
+
+  const needsV1 = params.appendV1 && !/\/v\d+$/i.test(base);
+  return new URL(`${base}${needsV1 ? "/v1" : ""}${suffix}`);
+}
+
 function normalizeIpAddress(address: string): string {
   const normalized = address.trim().replace(/^\[(.*)\]$/, "$1");
   const embeddedIpv4 = extractEmbeddedIpv4FromIpv6(normalized);
@@ -201,7 +265,17 @@ function isTrustedHostname(hostname: string): boolean {
 
 export async function resolveCustomApiTarget(
   rawUrl: string,
-  options?: { exactPath?: boolean },
+  options?: {
+    exactPath?: boolean;
+    /**
+     * Resolve a specific endpoint kind via {@link buildProviderEndpointUrl}
+     * instead of the legacy chat-completions-only path logic. When set,
+     * `appendV1` decides the `/v1` segment explicitly and `exactPath` is
+     * ignored (the endpoint builder already preserves the operator path).
+     */
+    endpoint?: ProviderEndpointKind;
+    appendV1?: boolean;
+  },
 ): Promise<ResolvedCustomApiTarget> {
   if (!rawUrl.trim()) {
     throw new Error("Missing custom API server URL");
@@ -209,7 +283,15 @@ export async function resolveCustomApiTarget(
 
   let url: URL;
   try {
-    url = options?.exactPath ? buildExactChatCompletionsUrl(rawUrl) : buildChatCompletionsUrl(rawUrl);
+    url = options?.endpoint
+      ? buildProviderEndpointUrl({
+          baseUrl: rawUrl,
+          endpoint: options.endpoint,
+          appendV1: Boolean(options.appendV1),
+        })
+      : options?.exactPath
+        ? buildExactChatCompletionsUrl(rawUrl)
+        : buildChatCompletionsUrl(rawUrl);
   } catch {
     throw new Error("Invalid custom API server URL");
   }
@@ -303,7 +385,11 @@ export async function resolveCustomApiTarget(
 
 export async function assertSafeCustomApiUrl(
   rawUrl: string,
-  options?: { exactPath?: boolean },
+  options?: {
+    exactPath?: boolean;
+    endpoint?: ProviderEndpointKind;
+    appendV1?: boolean;
+  },
 ): Promise<void> {
   await resolveCustomApiTarget(rawUrl, options);
 }

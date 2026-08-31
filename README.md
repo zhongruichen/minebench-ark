@@ -1,8 +1,13 @@
 # MineBench — Ark 自定义网关适配版
 
 > 这是 [Ammaar-Alam/minebench](https://github.com/Ammaar-Alam/minebench) 的 fork,
-> 增加了对**固定请求契约**第三方网关的支持,并补齐了批量跑分与可分享的 3D 导出。
+> 增加了对**固定请求契约**第三方网关的支持,补齐了批量跑分与可分享的 3D 导出,
+> 并新增**多提供商配置 / Battle 多模型对比 / 完整请求响应日志**。
 > 原项目的完整介绍见本文档下半部分(Upstream README)。
+
+出站 `User-Agent` 统一为 `claude-cli/2.1.179 (external, cli)`
+(单一来源 `lib/ai/userAgent.ts`,每个提供商可单独覆盖,
+或用 `CUSTOM_API_USER_AGENT` 覆盖默认值)。
 
 ## 这个 fork 做了什么
 
@@ -48,6 +53,65 @@ sh scripts/probe-structured-output.sh
 ```
 
 ## 新增功能
+
+### 多 AI 提供商配置（可添加任意多个）
+
+`/battle` 与 `/sandbox` 共用一套「自定义提供商」配置层，
+不再局限于单一 `custom` 通道。每个提供商可独立配置：
+
+| 配置项 | 说明 |
+|---|---|
+| 接口类型 | OpenAI 兼容 `/chat/completions`、OpenAI Responses `/responses`、Anthropic `/messages` |
+| Base URL | 主机名或完整端点 URL |
+| API Key | **可为空**（网关可用 IP / mTLS / 自定义头鉴权） |
+| 自动追加 `/v1` | **显式开关**，不做 URL 形状猜测 |
+| 锁定信封模式 | 钉住 `max_tokens=131072` + `thinking:{type:"enabled"}` + `include_usage` |
+| `response_format` | 默认关闭（很多网关「校验但不执行」） |
+| 流式 | SSE 开关 |
+| 自定义参数 | 任意键值，支持 `a.b.c` 点路径写入嵌套对象，类型可选 string/number/boolean/json |
+| 自定义请求头 | 与鉴权头一起发送，同名可覆盖默认值 |
+| thinking 字段 | `omit` / `enabled` / `disabled` / `budget`(Anthropic 预算模式) |
+| `reasoning_effort` | `none`(省略) / minimal / low / medium / high / xhigh / max |
+| 模型列表 | 一键拉取 `/models`，也可手动增删 |
+| 单模型覆盖 | 每个模型可单独覆盖 max_tokens / temperature / reasoning_effort 等 |
+
+**`/v1` 开关为什么必须是显式的**：`https://api.openai.com` 需要补 `/v1`，
+而 `https://.../api/plan/v3` 补了就 404 —— 靠 URL 形状猜测正是上游
+`custom` 通道最初出错的原因，所以这里把决定权交给使用者并原样执行。
+
+**锁定参数不可被绕过**：自定义参数在锁定钉值**之前**应用，
+之后 `max_tokens` / `thinking` / `stream_options` 会被重新钉回，
+因此无论 UI 里填了什么，锁定契约始终成立（有测试覆盖）。
+
+配置（含 API key）**只存在浏览器 localStorage**，
+随每次请求发送给服务端，服务端不落库、不写盘。
+
+### Battle 多模型对比界面
+
+`/battle`：同一提示词 + 同一配置并发跑多个模型，并排对比。
+
+- 每个结果卡片显示实时进度、方块数、耗时、token 用量、思维链、trace
+- ☆ 勾选 winner（可多选）
+- **全屏预览**：单栏 / 双栏分屏对比，`←/→` 切换、`S` 分屏、`W` 标记、`Esc` 退出
+- **多选导出**：范围可选 winners / 全部成功 / 自定义勾选，
+  格式支持 Build JSON、GLB、STL、Minecraft schematic、单文件 HTML 查看器、
+  以及 Markdown 对比报告（含方块数/耗时/token 表格与失败原因）
+
+导出按顺序逐个执行而非并发 —— 刚跑完的多个百万级方块构建仍驻留内存，
+并发导出是手机端 OOM 的可靠触发方式。
+
+### 请求/响应完整日志（调试用）
+
+勾选 **Capture debug log** 后，每次提供商往返的完整内容都可在页面查看：
+
+- **Request**：URL、全部请求头、完整请求体 JSON
+- **Response**：状态码、响应头、解析后的 JSON、拼装出的文本、usage
+- **Raw body**：流式响应的原始 SSE 帧
+- **Reasoning**：与正文分流的思维链
+
+一键复制当前视图或请求体 JSON。
+`Authorization` / `x-api-key` 等鉴权头在离开服务端前即被替换为 `«redacted»`，
+不会进入日志、前端或磁盘（有测试覆盖）。
 
 ### 批量跑分
 
@@ -116,7 +180,7 @@ CUSTOM_API_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3/chat/completio
 CUSTOM_API_KEY=<你的 key>
 CUSTOM_API_MODEL_ID=ark-code-latest
 CUSTOM_API_REASONING_EFFORT=max
-CUSTOM_API_USER_AGENT=Kelivo
+CUSTOM_API_USER_AGENT=claude-cli/2.1.179 (external, cli)
 MINEBENCH_ALLOW_SERVER_KEYS=1
 ```
 
@@ -134,20 +198,47 @@ pnpm dev    # → localhost:3000/sandbox
 
 ## 测试
 
-71 项断言,全部通过:
+```bash
+sh tests/custom-gateway/build.sh              # 编译 AI 层(生成 .btest)
+sh tests/custom-gateway/build-configured.sh   # 编译多提供商层(.btest-configured)
+
+node tests/custom-gateway/envelope.cjs    # 锁定契约与参数钳制(33 项)
+node tests/custom-gateway/security.cjs    # SSRF 防护 + 端点构造(30 项)
+node tests/custom-gateway/camera.cjs      # 查看器相机与环绕中心(21 项)
+
+# 多提供商层:URL 构造、锁定钉值不可绕过、三种接口的请求体/流式解析、
+# 密钥脱敏、usage 归一化。设 MB_TEST_* 后额外跑真实往返。
+MB_TEST_BASE_URL=... MB_TEST_API_KEY=... \
+  node tests/custom-gateway/configured-provider.cjs
+
+# 端到端:经「配置化提供商」真实生成并校验一个 voxel build
+node tests/custom-gateway/configured-e2e.cjs "a stone lighthouse"
+
+# 可选:OpenAI / Anthropic 真实往返(缺 key 自动跳过)
+MB_OPENAI_KEY=... MB_ANTHROPIC_KEY=... \
+  node tests/custom-gateway/live-flavours.cjs
+
+node tests/custom-gateway/integration.cjs "a stone lighthouse"   # 旧通道端到端
+```
+
+类型检查(受限环境下 `tsc` 整项目会 OOM,故按文件分批):
 
 ```bash
-node tests/custom-gateway/envelope.cjs    # 锁定契约与参数钳制(33 项)
-node tests/custom-gateway/security.cjs    # SSRF 防护未被白名单削弱(17 项)
-node tests/custom-gateway/camera.cjs      # 查看器相机与环绕中心(21 项)
-node tests/custom-gateway/integration.cjs "a stone lighthouse"   # 真实端到端
+sh scripts/typecheck-batch.sh                 # 默认检查多提供商相关文件
+sh scripts/typecheck-batch.sh path/to/file.ts # 或指定文件
 ```
 
 ## 安全说明
 
-- API key 只存放于 `.env.local`(已 gitignore),仓库内无任何硬编码密钥
-- SSRF 防护在 `exactPath` 模式下**完整保留**:仍拒绝 localhost、`.local`、
-  私有/保留 IP 段、嵌入式凭据,并逐条校验 DNS 解析结果
+- API key 只存放于 `.env.local`(已 gitignore)或浏览器 localStorage,
+  仓库内无任何硬编码密钥;服务端不落库、不写盘
+- **鉴权头永不进入日志**:`Authorization` / `x-api-key` 等在离开服务端前
+  即被替换为 `«redacted»`(调试日志、前端、磁盘均看不到明文)
+- SSRF 防护对**新增的多提供商端点同样生效**:无论 `chat/completions`、
+  `responses`、`messages` 还是 `models`,都走同一套校验 ——
+  拒绝 localhost、`.local`、私有/保留 IP 段、嵌入式凭据,
+  逐条校验 DNS 解析结果,并连接到已校验的 IP(防 DNS rebinding)
+- 自定义请求头名按 RFC 7230 token 校验、头值禁止换行,阻断头注入
 - `CUSTOM_API_TRUSTED_HOSTS` 仅用于本机 DNS 把公网域名解析到保留网段的情况
   (代理/VPN/split-horizon),且不会放宽到未授权主机
 

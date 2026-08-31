@@ -16,6 +16,10 @@ import {
   customGatewayGenerateText,
   normalizeCustomReasoningEffort,
 } from "@/lib/ai/providers/customGateway";
+import { configuredProviderGenerateText } from "@/lib/ai/providers/configuredProvider";
+import type { ProviderExchangeLog } from "@/lib/ai/providerExchangeLog";
+import type { ProviderConfig, ProviderModelConfig } from "@/lib/ai/providerConfig";
+import { effectiveModelSettings } from "@/lib/ai/providerConfig";
 import { openaiGenerateText } from "@/lib/ai/providers/openai";
 import { openrouterGenerateText } from "@/lib/ai/providers/openrouter";
 import { xaiGenerateText } from "@/lib/ai/providers/xai";
@@ -281,6 +285,16 @@ type ResolvedModel = {
   customGatewayStructuredOutput?: boolean;
   conversationId?: string;
   userAgent?: string;
+  /**
+   * When present, the model belongs to a user-configured provider and is
+   * dispatched through the configured-provider transport instead of any
+   * catalog adapter. Bypasses OpenRouter entirely: the operator named an
+   * explicit endpoint and silently rerouting would be wrong.
+   */
+  configured?: {
+    provider: ProviderConfig;
+    model: ProviderModelConfig;
+  };
 };
 
 function isBilledTimeoutStyleProviderError(message: string): boolean {
@@ -489,6 +503,10 @@ export type GenerateVoxelBuildParams = {
     customGatewayStructuredOutput?: boolean;
     conversationId?: string;
     userAgent?: string;
+    configured?: {
+      provider: ProviderConfig;
+      model: ProviderModelConfig;
+    };
   };
   prompt: string;
   gridSize: 64 | 256 | 512;
@@ -512,6 +530,8 @@ export type GenerateVoxelBuildParams = {
   /** Token usage reported by the provider (include_usage). */
   onUsage?: (usage: import("@/lib/ai/providers/customGateway").CustomUsage) => void;
   onProviderTrace?: (message: string) => void;
+  /** Full request/response record per attempt, for the debug log panel. */
+  onExchange?: (exchange: ProviderExchangeLog) => void;
   acquireBuildProcessing?: () => Promise<() => void>;
   returnExpandedBuild?: boolean;
 };
@@ -833,8 +853,64 @@ async function providerGenerateText(args: {
     configuration: AcceptedRequestConfigurationRecord,
   ) => void;
   onProviderRequest?: () => void;
+  onExchange?: (exchange: ProviderExchangeLog) => void;
 }): Promise<{ text: string }> {
   const { model } = args;
+
+  // Configured providers are dispatched first and unconditionally: the operator
+  // supplied an explicit endpoint, key policy, and parameter set, so neither the
+  // catalog key resolution nor the OpenRouter fallback applies.
+  if (model.configured) {
+    const { provider, model: modelConfig } = model.configured;
+    args.onProviderRoute?.("direct");
+    args.onProviderTrace?.(
+      `Routing via configured provider '${provider.label}' (${provider.apiKind}) -> ${modelConfig.modelId}.`,
+    );
+    args.signal?.throwIfAborted();
+
+    const result = await configuredProviderGenerateText({
+      provider,
+      model: modelConfig,
+      system: args.system,
+      user: args.user,
+      jsonSchema: args.jsonSchema,
+      signal: args.signal,
+      onDelta: args.onDelta,
+      onReasoningDelta: args.onReasoningDelta,
+      onUsage: args.onUsage,
+      onTrace: args.onProviderTrace,
+      onLog: args.onExchange,
+    });
+
+    const settings = effectiveModelSettings(provider, modelConfig);
+    if (settings.maxTokens !== undefined) {
+      args.onAcceptedOutputTokens?.(settings.maxTokens);
+    }
+    const acceptedConfiguration: AcceptedProviderRequestConfiguration = {
+      apiMode: provider.apiKind,
+      maxOutputTokens: settings.maxTokens ?? 0,
+      thinkingMode:
+        settings.thinkingMode === "omit"
+          ? settings.reasoningEffort === "none"
+            ? "default"
+            : `reasoning=${settings.reasoningEffort}`
+          : `thinking=${settings.thinkingMode}`,
+      temperature: settings.temperature ?? "default",
+      textVerbosity: "default",
+      responseFormat: provider.structuredOutput ? "json_schema" : "text",
+    };
+    args.onAcceptedRequestConfiguration?.(
+      acceptedProviderRequestConfigurationLine(acceptedConfiguration),
+    );
+    args.onAcceptedStructuredRequestConfiguration?.({
+      ...acceptedConfiguration,
+      providerRoute: "direct",
+      resolvedModelId: modelConfig.modelId,
+    });
+
+    return { text: result.text };
+  }
+
   const forceOpenRouter = Boolean(model.forceOpenRouter);
   const preferOpenRouter = Boolean(args.preferOpenRouter);
   const directKey = forceOpenRouter
@@ -1275,6 +1351,9 @@ export async function generateVoxelBuild(
           : undefined,
         onProviderTrace: params.onProviderTrace
           ? (message) => invokeCallback(params.onProviderTrace, message)
+          : undefined,
+        onExchange: params.onExchange
+          ? (exchange) => invokeCallback(params.onExchange, exchange)
           : undefined,
         onAcceptedOutputTokens: (tokens) => {
           acceptedOutputTokens = tokens;

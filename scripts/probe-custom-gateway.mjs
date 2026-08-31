@@ -32,7 +32,7 @@ const KEY = env.CUSTOM_API_KEY;
 const BASE = (env.CUSTOM_API_BASE_URL || "").replace(/\/+$/, "");
 const MODEL = env.CUSTOM_API_MODEL_ID || "ark-code-latest";
 const EFFORT = env.CUSTOM_API_REASONING_EFFORT || "medium";
-const UA = env.CUSTOM_API_USER_AGENT || "Kelivo";
+const UA = env.CUSTOM_API_USER_AGENT || "claude-cli/2.1.179 (external, cli)";
 
 if (!KEY || !BASE) {
   console.error("Missing CUSTOM_API_KEY / CUSTOM_API_BASE_URL in .env.local");

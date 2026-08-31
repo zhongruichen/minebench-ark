@@ -144,7 +144,7 @@ Authorization:      Bearer <CUSTOM_API_KEY>
 Content-Type:       application/json
 Accept:             text/event-stream    (流式) / application/json (非流式)
 X-Conversation-Id:  <UUID>               (未配置则每请求自动生成)
-User-Agent:         Kelivo               (可配置)
+User-Agent:         claude-cli/2.1.179 (external, cli)   (可配置)
 ```
 
 ### reasoning_effort 取值
@@ -275,7 +275,7 @@ CUSTOM_API_KEY=<你的 key>
 CUSTOM_API_MODEL_ID=ark-code-latest
 CUSTOM_API_DISPLAY_NAME=Ark Code (plan/v3)
 CUSTOM_API_REASONING_EFFORT=medium
-CUSTOM_API_USER_AGENT=Kelivo
+CUSTOM_API_USER_AGENT=claude-cli/2.1.179 (external, cli)
 
 # 允许服务端读取 .env 中的 key(否则必须在前端填写)
 MINEBENCH_ALLOW_SERVER_KEYS=1

@@ -223,7 +223,7 @@ async function runOne(slug, position) {
         displayName: DISPLAY,
         baseUrl: BASE,
         customGatewayMode: true,
-        userAgent: process.env.CUSTOM_API_USER_AGENT || "Kelivo",
+        userAgent: process.env.CUSTOM_API_USER_AGENT || "claude-cli/2.1.179 (external, cli)",
       },
       prompt: promptText,
       gridSize: GRID,

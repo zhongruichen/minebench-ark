@@ -49,7 +49,7 @@ generateVoxelBuild({
     displayName: "Ark Code (plan/v3)",
     baseUrl: process.env.CUSTOM_API_BASE_URL,
     customGatewayMode: true,
-    userAgent: process.env.CUSTOM_API_USER_AGENT || "Kelivo",
+    userAgent: process.env.CUSTOM_API_USER_AGENT || "claude-cli/2.1.179 (external, cli)",
   },
   prompt,
   gridSize: 64,

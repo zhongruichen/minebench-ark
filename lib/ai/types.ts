@@ -1,4 +1,6 @@
 import type { ModelKey } from "@/lib/ai/modelCatalog";
+import type { ProviderConfig } from "@/lib/ai/providerConfig";
+import type { ProviderExchangeLog } from "@/lib/ai/providerExchangeLog";
 import type { VoxelBuild } from "@/lib/voxel/types";
 
 export type PaletteMode = "simple" | "advanced";
@@ -50,6 +52,17 @@ export type GenerateModelRequest =
       modelKey: ModelKey;
     }
   | {
+      /**
+       * A model belonging to a user-configured provider. The provider config
+       * travels with the request because it is owned by the browser (localStorage),
+       * not the server — the server validates it and never persists it.
+       */
+      id: string;
+      kind: "configured";
+      providerId: string;
+      modelConfigId: string;
+    }
+  | {
       id: string;
       kind: "custom";
       provider: "custom";
@@ -87,6 +100,8 @@ export type GenerateRequest = {
   modelKeys?: ModelKey[];
   models?: GenerateModelRequest[];
   providerKeys?: ProviderApiKeys;
+  /** Configurations referenced by `kind: "configured"` model requests. */
+  providerConfigs?: ProviderConfig[];
 };
 
 export type GenerateEvent =
@@ -108,6 +123,16 @@ export type GenerateEvent =
       };
     }
   | { type: "trace"; modelKey: string; message: string }
+  | {
+      /**
+       * Full request/response record for the debug log panel. Emitted for
+       * configured providers so a failing generation can be diagnosed without
+       * server log access. Auth headers are redacted upstream.
+       */
+      type: "exchange";
+      modelKey: string;
+      exchange: ProviderExchangeLog;
+    }
   | {
       type: "result";
       modelKey: string;

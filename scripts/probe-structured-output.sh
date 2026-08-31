@@ -25,7 +25,7 @@ post() {
   curl -s -m 120 -X POST "$URL" \
     -H "Authorization: Bearer $CUSTOM_API_KEY" \
     -H "Content-Type: application/json" \
-    -H "User-Agent: ${CUSTOM_API_USER_AGENT:-Kelivo}" \
+    -H "User-Agent: ${CUSTOM_API_USER_AGENT:-claude-cli/2.1.179 (external, cli)}" \
     -d "$1"
 }
 show() {

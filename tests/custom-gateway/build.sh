@@ -42,7 +42,17 @@ cat > "$CFG" <<EOF
 EOF
 
 rm -rf "$OUT"
-node "$TSC" -p "$CFG" || true
+# tsc can abort mid-emit under tight memory (observed in iSH/Alpine sandboxes),
+# exiting 0 having written nothing. Retry until the expected output appears.
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 6 ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  node --max-old-space-size="${MB_TSC_HEAP:-1024}" "$TSC" -p "$CFG" >/dev/null 2>&1 || true
+  if [ -f "$OUT/ai/providers/customGateway.js" ]; then
+    break
+  fi
+  rm -rf "$OUT"
+done
 rm -f "$CFG"
 
 # lib/benchmark/prompts.ts is not in generateVoxelBuild's import graph, so tsc's
@@ -70,7 +80,14 @@ cat > "$CFG2" <<EOF2
   "files": ["$ROOT/lib/benchmark/prompts.ts"]
 }
 EOF2
-node "$TSC" -p "$CFG2" || true
+ATTEMPT=0
+while [ "$ATTEMPT" -lt 6 ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  node --max-old-space-size="${MB_TSC_HEAP:-1024}" "$TSC" -p "$CFG2" >/dev/null 2>&1 || true
+  if [ -f "$OUT/benchmark/prompts.js" ]; then
+    break
+  fi
+done
 rm -f "$CFG2"
 
 # resolveJsonModule emits no JSON, so copy the data files the runtime needs.

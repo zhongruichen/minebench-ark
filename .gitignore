@@ -88,6 +88,8 @@ next-env.d.ts
 # custom gateway probe artifacts
 .probe-out/
 .btest/
+.btest-configured/
+e2e-build.json
 
 # bench run artifacts
 .bench-out/

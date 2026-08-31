@@ -14,6 +14,7 @@ import { GenerationPreflightDialog } from "@/components/sandbox/GenerationPrefli
 import { GenerationGalleryButton } from "@/components/gallery/GenerationGalleryButton";
 import { readBuildVariantPayload } from "@/lib/arena/clientBuildResponse";
 import { extractBestVoxelBuildJson } from "@/lib/ai/jsonExtract";
+import { DEFAULT_OUTBOUND_USER_AGENT } from "@/lib/ai/userAgent";
 import {
   loadProviderKeysFromStorage,
   saveProviderKeysToStorage,
@@ -158,7 +159,7 @@ const DEFAULT_CUSTOM_MODEL: CustomSandboxModel = {
   structuredOutput: false,
   reasoningEffort: "medium",
   conversationId: "",
-  userAgent: "Kelivo",
+  userAgent: DEFAULT_OUTBOUND_USER_AGENT,
 };
 const CUSTOM_MODEL_STORAGE_KEY = "mb_custom_model_v2";
 const ENABLED_MODELS = MODEL_CATALOG.filter((model) => model.enabled);
@@ -2201,7 +2202,7 @@ export function SandboxLive({
                                 "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions",
                               gatewayMode: true,
                               reasoningEffort: "medium",
-                              userAgent: "Kelivo",
+                              userAgent: DEFAULT_OUTBOUND_USER_AGENT,
                             })
                           }
                         >
@@ -2261,7 +2262,7 @@ export function SandboxLive({
                             value={customModel.userAgent}
                             onChange={(e) => updateCustomModel({ userAgent: e.target.value })}
                             disabled={running}
-                            placeholder="Kelivo"
+                            placeholder={DEFAULT_OUTBOUND_USER_AGENT}
                           />
                         </label>
 

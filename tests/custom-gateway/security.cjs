@@ -98,6 +98,96 @@ async function mustResolve(label, url, opts, expectPath) {
     "/api/v1/chat/completions",
   );
 
+  console.log("\n=== SSRF guard still applies to configured-provider endpoints ===\n");
+
+  // The endpoint/appendV1 resolution path added for multi-provider support must
+  // not become an SSRF bypass: every rejection that holds for the legacy path
+  // has to hold here too.
+  delete process.env.CUSTOM_API_TRUSTED_HOSTS;
+
+  await mustReject("localhost via endpoint kind", "http://localhost:8080", {
+    endpoint: "chat_completions",
+    appendV1: true,
+  });
+  await mustReject("127.0.0.1 via endpoint kind", "http://127.0.0.1", {
+    endpoint: "messages",
+    appendV1: true,
+  });
+  await mustReject("10.x private via endpoint kind", "http://10.0.0.5", {
+    endpoint: "responses",
+    appendV1: true,
+  });
+  await mustReject("169.254 metadata via endpoint kind", "http://169.254.169.254", {
+    endpoint: "models",
+    appendV1: true,
+  });
+  await mustReject("embedded creds via endpoint kind", "https://u:p@example.com", {
+    endpoint: "chat_completions",
+    appendV1: true,
+  });
+  await mustReject("bad scheme via endpoint kind", "ftp://example.com", {
+    endpoint: "chat_completions",
+    appendV1: false,
+  });
+  await mustReject("mdns .local via endpoint kind", "http://box.local", {
+    endpoint: "chat_completions",
+    appendV1: true,
+  });
+  await mustReject("ipv4-mapped ipv6 loopback via endpoint kind", "http://[::ffff:127.0.0.1]", {
+    endpoint: "chat_completions",
+    appendV1: true,
+  });
+
+  console.log("\n=== endpoint construction is honoured, not guessed ===\n");
+
+  const expectPath = (label, baseUrl, endpoint, appendV1, expected) => {
+    let actual;
+    try {
+      actual = guard.buildProviderEndpointUrl({ baseUrl, endpoint, appendV1 }).pathname;
+    } catch (e) {
+      bad(label, e.message);
+      return;
+    }
+    if (actual === expected) pass(`${label} -> ${actual}`);
+    else bad(label, `${actual} != ${expected}`);
+  };
+
+  expectPath(
+    "appendV1=false keeps plan/v3 verbatim",
+    "https://example.com/api/plan/v3",
+    "chat_completions",
+    false,
+    "/api/plan/v3/chat/completions",
+  );
+  expectPath(
+    "appendV1=true injects /v1",
+    "https://example.com",
+    "chat_completions",
+    true,
+    "/v1/chat/completions",
+  );
+  expectPath(
+    "appendV1=true never doubles /v1",
+    "https://example.com/v1",
+    "chat_completions",
+    true,
+    "/v1/chat/completions",
+  );
+  expectPath(
+    "anthropic messages endpoint",
+    "https://example.com",
+    "messages",
+    true,
+    "/v1/messages",
+  );
+  expectPath(
+    "models endpoint rebases off a chat URL",
+    "https://example.com/v1/chat/completions",
+    "models",
+    true,
+    "/v1/models",
+  );
+
   console.log(fail === 0 ? "\nALL PASS" : `\n${fail} FAILED`);
   process.exit(fail === 0 ? 0 : 1);
 })();

@@ -10,6 +10,7 @@ import {
   type ResolvedCustomApiTarget,
 } from "@/lib/ai/providers/customApiGuard";
 import { tokenBudgetCandidates } from "@/lib/ai/tokenBudgets";
+import { resolveOutboundUserAgent } from "@/lib/ai/userAgent";
 import type { ProviderTelemetryCallbacks } from "@/lib/ai/types";
 
 type OpenAiCompatibleChatResponse = {
@@ -145,6 +146,8 @@ async function postToResolvedApi(params: {
         Authorization: `Bearer ${params.apiKey}`,
         "Content-Type": "application/json",
         Accept: params.stream ? "text/event-stream" : "application/json",
+        // Attribution must match the rest of the fleet; some gateways gate on it.
+        "User-Agent": resolveOutboundUserAgent(),
         Host: params.target.url.host,
         "Content-Length": Buffer.byteLength(params.body).toString(),
       },
