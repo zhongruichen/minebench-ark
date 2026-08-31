@@ -98,8 +98,8 @@ sh scripts/probe-structured-output.sh
 # 测试套件(不发网络请求)
 sh tests/custom-gateway/build.sh
 node tests/custom-gateway/envelope.cjs    # 锁定契约 33 项
-node tests/custom-gateway/security.cjs    # SSRF 防护 18 项
-node tests/custom-gateway/camera.cjs      # 查看器相机 20 项
+node tests/custom-gateway/security.cjs    # SSRF 防护 17 项
+node tests/custom-gateway/camera.cjs      # 查看器相机 21 项
 
 # 真实端到端
 node tests/custom-gateway/integration.cjs "a compact stone lighthouse"

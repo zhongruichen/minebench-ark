@@ -1,3 +1,178 @@
+# MineBench — Ark 自定义网关适配版
+
+> 这是 [Ammaar-Alam/minebench](https://github.com/Ammaar-Alam/minebench) 的 fork,
+> 增加了对**固定请求契约**第三方网关的支持,并补齐了批量跑分与可分享的 3D 导出。
+> 原项目的完整介绍见本文档下半部分(Upstream README)。
+
+## 这个 fork 做了什么
+
+原仓库的 `custom` 通道假设对端是标准 OpenAI 兼容服务。对于
+火山方舟 Agent Plan 端点(`/api/plan/v3`)这类**参数被锁定**的网关,
+有 5 处不兼容,均已实测确认并适配:
+
+| 问题 | 现象 | 处理 |
+|---|---|---|
+| URL 路径被改写 | `/api/plan/v3` → `/api/plan/v3/v1/...` → 404 | 新增 `exactPath` 模式,路径原样保留 |
+| `response_format` | **接受但不执行**(返回散文,不报错) | 默认不发送,改用提示词约束 + 容错提取 |
+| `reasoning_content` | 与 `content` 同级,会污染 JSON | 双通道分流,思维链独立展示 |
+| `max_tokens` | 上游默认 262144 → 网关 400 报错 | **硬钳制**到 131072,不可被调用方覆盖 |
+| `model` 回显 | 恒为 `"auto"` | 不用于校验 |
+
+`thinking: {type:"enabled"}` 恒发送;`reasoning_effort` 支持
+`low`/`medium`/`high`/`xhigh`/`max`,也可完全省略。取值非法会**抛错而非静默降级**。
+
+### 结构化输出的实测结论
+
+方舟平台**文档上是支持**结构化输出的,问题出在**端点层级**:
+
+- `/api/plan/v3` 只接受 agent-plan 模型(如 `ark-code-latest`);
+  请求 `doubao-seed-1-6-251015` 会返回 `UnsupportedModel`
+- plan 作用域的 key 打标准 `/api/v3` 端点会 401
+- 传 `response_format: "字符串"` 会正确报错 `expected an object`,
+  证明字段被解析;但传合法 schema 后**接受即丢弃**
+
+定量对比(同一提示各跑 3 次):
+
+| 方式 | 可解析为 JSON |
+|---|---|
+| `json_schema` strict | **0 / 3**(返回散文) |
+| 仅提示词约束 | **3 / 3** |
+
+因此默认关闭,并提供开关 —— 若你的 key 指向标准 `/api/v3`,
+在前端勾选即可启用真结构化输出,无需改代码。
+
+用这个脚本可以自行判断任意端点:
+
+```bash
+sh scripts/probe-structured-output.sh
+```
+
+## 新增功能
+
+### 批量跑分
+
+上游的 `pnpm batch:generate` 只接受目录内置的 `ModelKey`,无法驱动自定义端点。
+新脚本跑同一套官方 15 题:
+
+```bash
+sh tests/custom-gateway/build.sh     # 首次需编译 AI 层
+
+node scripts/bench-custom.mjs \
+  --grid 512 --palette advanced --reasoning max \
+  --attempts 3 --concurrency 15 \
+  --name run512 --html --gif
+```
+
+支持并发、断点续跑(`--resume`)、逐题落盘,自动生成 `report.md`
+(方块数、材质数、连通性、token 消耗)。
+
+### 单文件 3D 网页导出
+
+零依赖、零网络请求,数据 base64 内嵌,**双击即可打开**,手机也支持。
+内置两套相机(环绕 / 自由飞行),按 <kbd>V</kbd> 切换,切换时视角连续不跳。
+
+```bash
+node scripts/export-html-viewer.mjs <build.json> <out.html> "标题"
+```
+
+环绕模式的目标点跟随**可见表面质心**而非包围盒中心 ——
+后者对「宽地形 + 高细塔」这类结构会悬在半空。
+
+### 旋转 GIF 导出
+
+```bash
+node scripts/export-gif.mjs <build.json> <out.gif> [帧数] [尺寸]
+```
+
+### 方块颜色来自真实纹理
+
+从 `public/textures/atlas.png` 采样每个方块的平均色(77 个方块零缺失),
+顶面/侧面分开取色(草方块顶绿侧土),并对水、树叶等
+运行时染色的灰度遮罩纹理施加标准色调。
+
+```bash
+node scripts/build-block-colors.mjs   # 换材质包后重跑
+```
+
+### 诊断工具
+
+```bash
+node scripts/analyze-build.cjs <build.json>   # 连通性、分层统计、材质直方图
+node scripts/slice-build.cjs   <build.json>   # ASCII 剖面,排查结构问题
+```
+
+## 快速开始
+
+```bash
+pnpm install
+pnpm atlas                           # 生成纹理图集(首次必须)
+sh tests/custom-gateway/build.sh     # 编译 AI 层供脚本使用
+```
+
+创建 `.env.local`:
+
+```bash
+CUSTOM_API_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions
+CUSTOM_API_KEY=<你的 key>
+CUSTOM_API_MODEL_ID=ark-code-latest
+CUSTOM_API_REASONING_EFFORT=max
+CUSTOM_API_USER_AGENT=Kelivo
+MINEBENCH_ALLOW_SERVER_KEYS=1
+```
+
+网页版:
+
+```bash
+pnpm dev    # → localhost:3000/sandbox
+```
+
+模型下拉框选 **Custom → OpenAI-compatible model**,勾选
+**Locked-envelope gateway mode**,点 **Apply Ark plan/v3 preset** 自动填好配置。
+
+完整说明见 **[QUICKSTART.md](QUICKSTART.md)**,
+技术细节与全部实验矩阵见 **[docs/CUSTOM_PROVIDER.md](docs/CUSTOM_PROVIDER.md)**。
+
+## 测试
+
+71 项断言,全部通过:
+
+```bash
+node tests/custom-gateway/envelope.cjs    # 锁定契约与参数钳制(33 项)
+node tests/custom-gateway/security.cjs    # SSRF 防护未被白名单削弱(17 项)
+node tests/custom-gateway/camera.cjs      # 查看器相机与环绕中心(21 项)
+node tests/custom-gateway/integration.cjs "a stone lighthouse"   # 真实端到端
+```
+
+## 安全说明
+
+- API key 只存放于 `.env.local`(已 gitignore),仓库内无任何硬编码密钥
+- SSRF 防护在 `exactPath` 模式下**完整保留**:仍拒绝 localhost、`.local`、
+  私有/保留 IP 段、嵌入式凭据,并逐条校验 DNS 解析结果
+- `CUSTOM_API_TRUSTED_HOSTS` 仅用于本机 DNS 把公网域名解析到保留网段的情况
+  (代理/VPN/split-horizon),且不会放宽到未授权主机
+
+## 与上游的差异
+
+- 压成单提交,未保留上游 commit 历史
+- 未包含 `.github/workflows/ci.yml`(上游 CI,依赖其自有 secrets)
+- 其余文件与上游一致
+
+## 已知限制
+
+- **`max_tokens` 锁定 131072**。grid 512 理论上限 1.34 亿方块,
+  但受 token 上限约束,实际收益相比 grid 256 有限
+  (生成的是 JS 代码而非坐标列表,所以实际方块数可远超 token 估算值)
+- 保存构建、画廊、排行榜需要 Postgres
+  (`pnpm db:up && pnpm db:wait && pnpm prisma:migrate`);
+  纯生成与跑分不需要
+
+---
+---
+
+# Upstream README
+
+以下为原项目 [Ammaar-Alam/minebench](https://github.com/Ammaar-Alam/minebench) 的说明,原文保留。
+
 
 <p align="center">
   <a href="https://minebench.ai">

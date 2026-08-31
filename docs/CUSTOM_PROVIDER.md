@@ -436,7 +436,7 @@ node scripts/export-html-viewer.mjs <build.json> <out.html> "标题文字"
 - 半透明像素按 alpha 加权,不会被边缘拉灰
 - 水、树叶、草等在游戏里靠运行时染色的**灰度遮罩纹理**,按 `RUNTIME_TINTS`
   施加标准色调(否则平均出来是灰色)
-- 输出 `lib/blocks/block-colors.generated.json`(80 个方块,零缺失)
+- 输出 `lib/blocks/block-colors.generated.json`(77 个方块,零缺失)
 
 换材质包后重跑该脚本即可。
 
