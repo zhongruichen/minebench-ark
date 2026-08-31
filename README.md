@@ -68,8 +68,8 @@ sh scripts/probe-structured-output.sh
 | 锁定信封模式 | 钉住 `max_tokens=131072` + `thinking:{type:"enabled"}` + `include_usage` |
 | `response_format` | 默认关闭（很多网关「校验但不执行」） |
 | 流式 | SSE 开关 |
-| 自定义参数 | 任意键值，支持 `a.b.c` 点路径写入嵌套对象，类型可选 string/number/boolean/json |
-| 自定义请求头 | 与鉴权头一起发送，同名可覆盖默认值 |
+| 自定义参数（Custom Body） | 任意键值对，类型自动推断（也可强制 string/number/boolean/json），支持 `a.b.c` 点路径写入嵌套对象 |
+| 自定义请求头（Custom Headers） | 任意键值对，与鉴权头一起发送 |
 | thinking 字段 | `omit` / `enabled` / `disabled` / `budget`(Anthropic 预算模式) |
 | `reasoning_effort` | `none`(省略) / minimal / low / medium / high / xhigh / max |
 | 模型列表 | 一键拉取 `/models`，也可手动增删 |
@@ -79,9 +79,11 @@ sh scripts/probe-structured-output.sh
 而 `https://.../api/plan/v3` 补了就 404 —— 靠 URL 形状猜测正是上游
 `custom` 通道最初出错的原因，所以这里把决定权交给使用者并原样执行。
 
-**锁定参数不可被绕过**：自定义参数在锁定钉值**之前**应用，
-之后 `max_tokens` / `thinking` / `stream_options` 会被重新钉回，
-因此无论 UI 里填了什么，锁定契约始终成立（有测试覆盖）。
+**Custom Request 优先级最高**：自定义请求头/请求体在预设**之后**应用，
+因此会覆盖同名的预设值（含锁定信封的 `max_tokens` / `thinking`）。
+覆盖发生时会在 trace 与调试日志中明确列出新旧值 ——
+覆盖锁定值可能导致网关 400，这种风险必须可见。
+若未被覆盖，锁定钉值照常生效（有测试覆盖两种情况）。
 
 配置（含 API key）**只存在浏览器 localStorage**，
 随每次请求发送给服务端，服务端不落库、不写盘。
@@ -112,6 +114,38 @@ sh scripts/probe-structured-output.sh
 一键复制当前视图或请求体 JSON。
 `Authorization` / `x-api-key` 等鉴权头在离开服务端前即被替换为 `«redacted»`，
 不会进入日志、前端或磁盘（有测试覆盖）。
+
+### Custom Request：自定义请求头 / 自定义请求体
+
+「Custom Headers」与「Custom Body」是**独立于其它设置的一块**，
+用来补充 MineBench 没有预设字段的参数，最大化自定义空间。
+
+**优先级：Custom Request 最高。** 只要你在这里写了某个 key，
+它就会覆盖同名的一切 —— 包括该提供商自身的设置、以及锁定信封预设
+（`max_tokens` / `thinking` / `stream_options`）。
+这正是「逃生舱」的意义：预设对你的网关不合适时，你能直接改掉它。
+
+**类型自动推断**，不必先选类型：
+
+| 输入 | 发送为 |
+|---|---|
+| `{"type": "enabled"}` | JSON 对象 |
+| `[1,2]` | JSON 数组 |
+| `128000` | 数字 |
+| `true` / `false` / `null` | 字面量 |
+| `max` | 字符串 |
+| `007`、`1.50` | **字符串**（转成数字会改变值，故保持原样） |
+| `{oops`（非法 JSON） | 字符串（降级而非报错） |
+
+需要强制类型时勾选 **show types**（例如把看起来像数字的版本号锁成字符串）。
+输入框下方会实时显示「实际会发送成什么」。
+
+**覆盖会被明确提示**：若某个 key 覆盖掉了预设值，
+trace 与调试日志的 Request 标签都会列出
+`max_tokens: 131072 -> 128000`。因为覆盖锁定值虽然合法，
+却可能让网关直接 400 —— 这种情况必须看得见，不能静默。
+
+点路径可写嵌套字段：`stream_options.include_usage` → `{"stream_options":{"include_usage":...}}`。
 
 ### 批量跑分
 
@@ -206,10 +240,14 @@ node tests/custom-gateway/envelope.cjs    # 锁定契约与参数钳制(33 项)
 node tests/custom-gateway/security.cjs    # SSRF 防护 + 端点构造(30 项)
 node tests/custom-gateway/camera.cjs      # 查看器相机与环绕中心(21 项)
 
-# 多提供商层:URL 构造、锁定钉值不可绕过、三种接口的请求体/流式解析、
-# 密钥脱敏、usage 归一化。设 MB_TEST_* 后额外跑真实往返。
+# 多提供商层:URL 构造、Custom Request 覆盖优先级、类型推断、
+# 三种接口的请求体/流式解析、密钥脱敏、usage 归一化。
 MB_TEST_BASE_URL=... MB_TEST_API_KEY=... \
   node tests/custom-gateway/configured-provider.cjs
+
+# Custom Request 真实往返:确认自定义头/体真的上了线,且覆盖生效
+MB_TEST_BASE_URL=... MB_TEST_API_KEY=... \
+  node tests/custom-gateway/custom-request-live.cjs
 
 # 端到端:经「配置化提供商」真实生成并校验一个 voxel build
 node tests/custom-gateway/configured-e2e.cjs "a stone lighthouse"

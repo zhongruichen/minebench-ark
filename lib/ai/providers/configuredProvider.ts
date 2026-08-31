@@ -409,6 +409,16 @@ export async function configuredProviderGenerateText(params: {
     appendV1: provider.appendV1,
   });
 
+  // Custom Body outranks the presets by design, but overriding a locked value
+  // can make the gateway reject the request — so say so instead of letting the
+  // operator hunt for why their preset did not take effect.
+  for (const override of built.overrides) {
+    params.onTrace?.(
+      `Custom Body overrode '${override.key}': ${JSON.stringify(override.previous)} -> ` +
+        `${JSON.stringify(override.next)}.`,
+    );
+  }
+
   const bodyText = JSON.stringify(built.body);
   const outboundHeaders: Record<string, string> = {
     "Content-Type": "application/json",
@@ -427,6 +437,7 @@ export async function configuredProviderGenerateText(params: {
     method: "POST",
     requestHeaders: redactHeaders(outboundHeaders),
     requestBody: built.body,
+    overrides: built.overrides.length > 0 ? built.overrides : undefined,
     startedAt: Date.now(),
   };
   const finish = (): ProviderExchangeLog => {

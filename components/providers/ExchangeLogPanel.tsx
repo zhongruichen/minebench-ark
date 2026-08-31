@@ -86,6 +86,18 @@ export function ExchangeLogPanel({ entries, onClear }: Props) {
         return [
           `${active.method} ${active.url}`,
           "",
+          ...(active.overrides && active.overrides.length > 0
+            ? [
+                "--- Custom Body overrides (custom config wins) ---",
+                ...active.overrides.map(
+                  (override) =>
+                    `${override.key}: ${JSON.stringify(override.previous)} -> ${JSON.stringify(
+                      override.next,
+                    )}`,
+                ),
+                "",
+              ]
+            : []),
           "--- headers ---",
           formatJson(active.requestHeaders),
           "",

@@ -46,8 +46,16 @@ export type ReasoningEffortChoice = (typeof REASONING_EFFORT_CHOICES)[number];
 export const THINKING_MODES = ["omit", "enabled", "disabled", "budget"] as const;
 export type ThinkingMode = (typeof THINKING_MODES)[number];
 
-/** A single extra request-body parameter, typed so the JSON stays predictable. */
-export type CustomParamType = "string" | "number" | "boolean" | "json";
+/**
+ * Value type for an extra request-body parameter.
+ *
+ * `auto` (the default) infers the JSON type from the text, so a user can paste
+ * `{"type":"enabled"}`, `128000`, or `max` without first choosing a type. The
+ * explicit types remain for the cases inference would get wrong — most often
+ * forcing `string` for a value that merely looks numeric (a version like
+ * `"1.0"`, or an id with leading zeros).
+ */
+export type CustomParamType = "auto" | "string" | "number" | "boolean" | "json";
 
 export type CustomParam = {
   /** Dot paths are supported (`stream_options.include_usage`). */
@@ -217,6 +225,41 @@ export const PROVIDER_PRESETS: ReadonlyArray<{
   },
 ];
 
+/**
+ * Infers the JSON value from raw text, the way a user typing into a key/value
+ * box expects: `{...}`/`[...]` parse as JSON, `true`/`false`/`null` as
+ * literals, bare numbers as numbers, everything else stays a string.
+ *
+ * Only strict, unambiguous forms convert. Notably a numeric-looking string is
+ * only converted when it round-trips exactly (`String(Number(v)) === v`), so
+ * `007`, `1.50`, and `1e999` stay strings rather than silently changing value.
+ */
+export function inferCustomParamValue(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+
+  const first = trimmed[0];
+  if (first === "{" || first === "[") {
+    try {
+      return JSON.parse(trimmed) as unknown;
+    } catch {
+      // Malformed JSON object/array: fall through and send it as a string
+      // rather than rejecting the whole request.
+      return raw;
+    }
+  }
+
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed === "null") return null;
+
+  if (/^-?\d+(\.\d+)?$/.test(trimmed) && String(Number(trimmed)) === trimmed) {
+    return Number(trimmed);
+  }
+
+  return raw;
+}
+
 /** Parses a {@link CustomParam} value into the JSON value to send. */
 export function parseCustomParamValue(param: CustomParam): unknown {
   switch (param.type) {
@@ -240,8 +283,10 @@ export function parseCustomParamValue(param: CustomParam): unknown {
         throw new Error(`Parameter '${param.key}' is not valid JSON: ${param.value}`);
       }
     }
-    default:
+    case "string":
       return param.value;
+    default:
+      return inferCustomParamValue(param.value);
   }
 }
 
@@ -266,16 +311,58 @@ export function assignDeep(target: Record<string, unknown>, key: string, value: 
   cursor[segments[segments.length - 1]] = value;
 }
 
-/** Applies every enabled param, in order, to a request body. */
+/**
+ * A key whose value a custom parameter replaced.
+ *
+ * Surfaced to the caller (trace + debug log) because a silent override is a
+ * debugging trap: someone pins `max_tokens` in Custom Body, the gateway rejects
+ * it, and nothing in the UI explains why the locked value did not apply.
+ */
+export type CustomParamOverride = {
+  key: string;
+  previous: unknown;
+  next: unknown;
+};
+
+/** Reads a possibly-dotted key, returning `undefined` when absent. */
+function readDeep(source: Record<string, unknown>, key: string): unknown {
+  const segments = key.split(".").map((segment) => segment.trim()).filter(Boolean);
+  let cursor: unknown = source;
+  for (const segment of segments) {
+    if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)) return undefined;
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  return cursor;
+}
+
+/**
+ * Applies every enabled param, in order, to a request body.
+ *
+ * Custom params are the LAST word on any key they name — including keys the
+ * adapter or the locked-envelope preset already set. That is the point of the
+ * feature: it is the escape hatch for parameters MineBench has no preset for,
+ * and for correcting one it gets wrong for a given gateway.
+ *
+ * Returns the collisions so callers can report them.
+ */
 export function applyCustomParams(
   body: Record<string, unknown>,
   params: readonly CustomParam[] | undefined,
-): void {
+): CustomParamOverride[] {
+  const overrides: CustomParamOverride[] = [];
   for (const param of params ?? []) {
     if (!param.enabled) continue;
-    if (!param.key.trim()) continue;
-    assignDeep(body, param.key.trim(), parseCustomParamValue(param));
+    const key = param.key.trim();
+    if (!key) continue;
+
+    const next = parseCustomParamValue(param);
+    const previous = readDeep(body, key);
+    if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(next)) {
+      overrides.push({ key, previous, next });
+    }
+    assignDeep(body, key, next);
   }
+  return overrides;
 }
 
 /** Merges provider-level defaults with a model's overrides. */

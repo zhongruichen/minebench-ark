@@ -11,6 +11,11 @@ export type ProviderExchangeLog = {
   /** Auth headers are replaced with a placeholder before this leaves the server. */
   requestHeaders: Record<string, string>;
   requestBody: unknown;
+  /**
+   * Preset body keys that Custom Body replaced. Present only on collision, so
+   * the log shows why a preset value is absent from the request.
+   */
+  overrides?: { key: string; previous: unknown; next: unknown }[];
   status?: number;
   responseHeaders?: Record<string, string>;
   /** Raw response text: concatenated SSE frames when streaming. */

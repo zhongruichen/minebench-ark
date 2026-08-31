@@ -15,7 +15,7 @@ import {
 
 const customParamSchema = z.object({
   key: z.string().trim().min(1).max(120),
-  type: z.enum(["string", "number", "boolean", "json"]),
+  type: z.enum(["auto", "string", "number", "boolean", "json"]),
   value: z.string().max(20_000),
   enabled: z.boolean(),
 });

@@ -116,29 +116,116 @@ check(
   "https://api.openai.com/v1/responses",
 );
 
-console.log("\n=== locked envelope cannot be overridden ===\n");
+console.log("\n=== custom config wins over presets (escape hatch) ===\n");
 
+// Custom Body is the last word: it must override provider settings AND the
+// locked-envelope preset. This is the inverse of the earlier behaviour and the
+// whole point of the feature, so it is asserted explicitly.
 const locked = req.buildProviderRequestBody({
   provider: baseProvider({
     lockedEnvelope: true,
     maxTokens: 999_999,
     thinkingMode: "disabled",
     reasoningEffort: "max",
-    // A hostile/careless custom param must not break the locked contract.
     params: [
-      { key: "max_tokens", type: "number", value: "999999", enabled: true },
-      { key: "thinking.type", type: "string", value: "disabled", enabled: true },
+      { key: "max_tokens", type: "auto", value: "128000", enabled: true },
+      { key: "thinking", type: "auto", value: '{"type":"disabled"}', enabled: true },
     ],
   }),
   model: model(),
   system: "s",
   user: "u",
 });
-check("locked max_tokens clamps", locked.body.max_tokens, 131072);
-check("locked thinking re-pinned", locked.body.thinking, { type: "enabled" });
-check("locked stream_options", locked.body.stream_options, { include_usage: true });
+check("custom max_tokens overrides locked pin", locked.body.max_tokens, 128000);
+check("custom thinking overrides locked pin", locked.body.thinking, { type: "disabled" });
+check("locked stream_options still applied", locked.body.stream_options, { include_usage: true });
 check("locked reasoning_effort passes through", locked.body.reasoning_effort, "max");
 check("locked drops response_format", "response_format" in locked.body, false);
+// Overriding a locked value is legitimate but risky, so it must be reported.
+check("override collision reported", locked.overrides.length, 2);
+check(
+  "override records old and new",
+  locked.overrides.find((o) => o.key === "max_tokens"),
+  { key: "max_tokens", previous: 131072, next: 128000 },
+);
+
+// With no colliding params the preset must still hold exactly as before.
+const lockedClean = req.buildProviderRequestBody({
+  provider: baseProvider({ lockedEnvelope: true, maxTokens: 999_999 }),
+  model: model(),
+  system: "s",
+  user: "u",
+});
+check("preset clamps when uncontested", lockedClean.body.max_tokens, 131072);
+check("preset thinking when uncontested", lockedClean.body.thinking, { type: "enabled" });
+check("no spurious overrides", lockedClean.overrides.length, 0);
+
+console.log("\n=== automatic type inference ===\n");
+
+const inferred = req.buildProviderRequestBody({
+  provider: baseProvider({
+    params: [
+      { key: "obj", type: "auto", value: '{"type": "enabled"}', enabled: true },
+      { key: "arr", type: "auto", value: "[1,2]", enabled: true },
+      { key: "num", type: "auto", value: "128000", enabled: true },
+      { key: "neg", type: "auto", value: "-1.5", enabled: true },
+      { key: "yes", type: "auto", value: "true", enabled: true },
+      { key: "nil", type: "auto", value: "null", enabled: true },
+      { key: "word", type: "auto", value: "max", enabled: true },
+      // Must stay a string: converting would change the value.
+      { key: "padded", type: "auto", value: "007", enabled: true },
+      { key: "trailing", type: "auto", value: "1.50", enabled: true },
+      // Malformed JSON degrades to a string rather than failing the request.
+      { key: "broken", type: "auto", value: "{oops", enabled: true },
+      // Explicit type must beat inference.
+      { key: "forced", type: "string", value: "128000", enabled: true },
+    ],
+  }),
+  model: model(),
+  system: "s",
+  user: "u",
+});
+check("infers object", inferred.body.obj, { type: "enabled" });
+check("infers array", inferred.body.arr, [1, 2]);
+check("infers number", inferred.body.num, 128000);
+check("infers negative float", inferred.body.neg, -1.5);
+check("infers boolean", inferred.body.yes, true);
+check("infers null", inferred.body.nil, null);
+check("keeps bare word as string", inferred.body.word, "max");
+check("keeps zero-padded as string", inferred.body.padded, "007");
+check("keeps trailing-zero decimal as string", inferred.body.trailing, "1.50");
+check("malformed JSON degrades to string", inferred.body.broken, "{oops");
+check("explicit string type beats inference", inferred.body.forced, "128000");
+
+console.log("\n=== reference screenshot config, end to end ===\n");
+
+// The exact configuration from the reference UI: a UA header plus three body
+// keys, two of which collide with locked-envelope pins.
+const reference = req.buildProviderRequestBody({
+  provider: baseProvider({
+    lockedEnvelope: true,
+    headers: [
+      { name: "User-Agent", value: "claude-cli/2.1.179 (external, cli)", enabled: true },
+    ],
+    params: [
+      { key: "thinking", type: "auto", value: '{"type": "enabled"}', enabled: true },
+      { key: "reasoning_effort", type: "auto", value: "max", enabled: true },
+      { key: "max_tokens", type: "auto", value: "128000", enabled: true },
+    ],
+  }),
+  model: model({ modelId: "ark-code-latest" }),
+  system: "s",
+  user: "u",
+});
+check("reference thinking", reference.body.thinking, { type: "enabled" });
+check("reference reasoning_effort", reference.body.reasoning_effort, "max");
+check("reference max_tokens (custom wins)", reference.body.max_tokens, 128000);
+check("reference UA header", reference.headers["User-Agent"], "claude-cli/2.1.179 (external, cli)");
+// thinking was already {type:"enabled"} so it is NOT a collision; only
+// max_tokens actually changed.
+check("reference reports only the real collision", reference.overrides.map((o) => o.key), [
+  "max_tokens",
+]);
 
 console.log("\n=== per-model overrides beat provider defaults ===\n");
 
@@ -161,6 +248,7 @@ const withParams = req.buildProviderRequestBody({
       { key: "stream_options.include_usage", type: "boolean", value: "false", enabled: true },
       { key: "metadata", type: "json", value: '{"tag":"x"}', enabled: true },
       { key: "ignored", type: "string", value: "no", enabled: false },
+      { key: "", type: "string", value: "no-key", enabled: true },
     ],
   }),
   model: model(),
@@ -171,6 +259,7 @@ check("number param", withParams.body.top_p, 0.9);
 check("nested boolean param", withParams.body.stream_options, { include_usage: false });
 check("json param", withParams.body.metadata, { tag: "x" });
 check("disabled param omitted", "ignored" in withParams.body, false);
+check("blank key ignored", "undefined" in withParams.body, false);
 
 console.log("\n=== flavour-specific bodies ===\n");
 

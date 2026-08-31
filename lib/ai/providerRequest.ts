@@ -10,6 +10,7 @@ import {
   applyCustomParams,
   effectiveModelSettings,
   LOCKED_ENVELOPE_MAX_TOKENS,
+  type CustomParamOverride,
   type ProviderApiKind,
   type ProviderConfig,
   type ProviderModelConfig,
@@ -50,6 +51,8 @@ export type BuiltProviderRequest = {
   /** Header names/values that the transport must send in addition to auth. */
   headers: Record<string, string>;
   stream: boolean;
+  /** Preset keys that Custom Body replaced, for warning the operator. */
+  overrides: CustomParamOverride[];
 };
 
 /**
@@ -153,10 +156,10 @@ export function buildProviderRequestBody(params: {
     }
   }
 
-  // Operator-supplied params. Applied before the locked pins are re-asserted so
-  // that a locked gateway stays valid no matter what was typed into the UI.
-  applyCustomParams(body, settings.params);
-
+  // The locked-envelope preset is applied FIRST so that custom params can
+  // override it. It is a convenience preset for a known gateway contract, not a
+  // security boundary — the operator owns the endpoint and must be able to
+  // correct any value MineBench gets wrong for it.
   if (provider.lockedEnvelope && provider.apiKind === "openai_chat") {
     body.max_tokens = Math.min(
       typeof body.max_tokens === "number" ? body.max_tokens : LOCKED_ENVELOPE_MAX_TOKENS,
@@ -168,6 +171,12 @@ export function buildProviderRequestBody(params: {
     if (!provider.structuredOutput) delete body.response_format;
   }
 
+  // Custom Body has the last word on every key it names, including the preset
+  // keys above. Collisions are returned so the caller can warn: overriding a
+  // locked value is legitimate but can make the gateway reject the request, and
+  // that must not fail silently.
+  const overrides = applyCustomParams(body, settings.params);
+
   const headers: Record<string, string> = {};
   for (const header of provider.headers ?? []) {
     if (!header.enabled) continue;
@@ -176,7 +185,7 @@ export function buildProviderRequestBody(params: {
     headers[name] = header.value;
   }
 
-  return { endpoint, body, headers, stream };
+  return { endpoint, body, headers, stream, overrides };
 }
 
 /** Auth headers for a flavour. Anthropic uses `x-api-key`, not Bearer. */

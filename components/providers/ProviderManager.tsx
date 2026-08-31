@@ -7,9 +7,6 @@ import {
   PROVIDER_PRESETS,
   REASONING_EFFORT_CHOICES,
   THINKING_MODES,
-  type CustomHeader,
-  type CustomParam,
-  type CustomParamType,
   type ProviderApiKind,
   type ProviderConfig,
   type ProviderModelConfig,
@@ -23,6 +20,7 @@ import {
   providerConfigIssues,
   selectionKey,
 } from "@/lib/ai/providerStore";
+import { CustomRequestEditor } from "@/components/providers/CustomRequestEditor";
 import { readClientErrorResponse } from "@/lib/clientErrorResponse";
 
 type Props = {
@@ -39,8 +37,6 @@ const THINKING_MODE_LABELS: Record<ThinkingMode, string> = {
   disabled: 'thinking: {type:"disabled"}',
   budget: 'thinking: {type:"enabled", budget_tokens}',
 };
-
-const PARAM_TYPES: CustomParamType[] = ["string", "number", "boolean", "json"];
 
 function numberOrUndefined(raw: string): number | undefined {
   const trimmed = raw.trim();
@@ -527,33 +523,12 @@ export function ProviderManager({
                   </label>
                 </div>
 
-                <KeyValueEditor
-                  title="Custom parameters"
-                  hint="Merged into the request body. Dot paths create nested objects (e.g. stream_options.include_usage). Applied before locked-envelope pins."
-                  rows={provider.params}
+                <CustomRequestEditor
+                  headers={provider.headers}
+                  params={provider.params}
                   disabled={disabled}
-                  onChange={(params) => updateProvider(provider.id, { params })}
-                  emptyRow={() => ({ key: "", type: "string", value: "", enabled: true })}
-                  renderExtra={(row, update) => (
-                    <select
-                      className="mb-field h-9 w-24 text-xs"
-                      value={row.type}
-                      disabled={disabled}
-                      onChange={(e) => update({ type: e.target.value as CustomParamType })}
-                    >
-                      {PARAM_TYPES.map((type) => (
-                        <option key={type} value={type}>
-                          {type}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                />
-
-                <HeaderEditor
-                  rows={provider.headers}
-                  disabled={disabled}
-                  onChange={(headers) => updateProvider(provider.id, { headers })}
+                  onHeadersChange={(headers) => updateProvider(provider.id, { headers })}
+                  onParamsChange={(params) => updateProvider(provider.id, { params })}
                 />
 
                 <div className="rounded border border-border/50 bg-bg/60 p-3">
@@ -771,170 +746,6 @@ export function ProviderManager({
           </div>
         );
       })}
-    </div>
-  );
-}
-
-function KeyValueEditor({
-  title,
-  hint,
-  rows,
-  disabled,
-  onChange,
-  emptyRow,
-  renderExtra,
-}: {
-  title: string;
-  hint: string;
-  rows: CustomParam[];
-  disabled?: boolean;
-  onChange: (rows: CustomParam[]) => void;
-  emptyRow: () => CustomParam;
-  renderExtra?: (row: CustomParam, update: (patch: Partial<CustomParam>) => void) => React.ReactNode;
-}) {
-  return (
-    <div className="rounded border border-border/50 bg-bg/60 p-3">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-xs font-medium">{title}</span>
-        <button
-          type="button"
-          className="mb-btn h-8 px-2 text-xs"
-          disabled={disabled}
-          onClick={() => onChange([...rows, emptyRow()])}
-        >
-          + Add
-        </button>
-      </div>
-      <p className="mb-2 text-[11px] leading-relaxed text-muted">{hint}</p>
-      <div className="flex flex-col gap-2">
-        {rows.map((row, index) => (
-          <div key={`${row.key}-${index}`} className="flex flex-wrap items-center gap-2">
-            <input
-              type="checkbox"
-              checked={row.enabled}
-              disabled={disabled}
-              title="Include this parameter"
-              onChange={(e) =>
-                onChange(
-                  rows.map((entry, i) =>
-                    i === index ? { ...entry, enabled: e.target.checked } : entry,
-                  ),
-                )
-              }
-            />
-            <input
-              className="mb-field h-9 w-36 text-xs"
-              placeholder="key"
-              value={row.key}
-              disabled={disabled}
-              onChange={(e) =>
-                onChange(rows.map((entry, i) => (i === index ? { ...entry, key: e.target.value } : entry)))
-              }
-            />
-            {renderExtra?.(row, (patch) =>
-              onChange(rows.map((entry, i) => (i === index ? { ...entry, ...patch } : entry))),
-            )}
-            <input
-              className="mb-field h-9 min-w-0 flex-1 text-xs"
-              placeholder="value"
-              value={row.value}
-              disabled={disabled}
-              onChange={(e) =>
-                onChange(
-                  rows.map((entry, i) => (i === index ? { ...entry, value: e.target.value } : entry)),
-                )
-              }
-            />
-            <button
-              type="button"
-              className="mb-btn h-9 px-2 text-xs"
-              disabled={disabled}
-              onClick={() => onChange(rows.filter((_, i) => i !== index))}
-            >
-              ✕
-            </button>
-          </div>
-        ))}
-        {rows.length === 0 ? <p className="text-[11px] text-muted">None.</p> : null}
-      </div>
-    </div>
-  );
-}
-
-function HeaderEditor({
-  rows,
-  disabled,
-  onChange,
-}: {
-  rows: CustomHeader[];
-  disabled?: boolean;
-  onChange: (rows: CustomHeader[]) => void;
-}) {
-  return (
-    <div className="rounded border border-border/50 bg-bg/60 p-3">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-xs font-medium">Extra headers</span>
-        <button
-          type="button"
-          className="mb-btn h-8 px-2 text-xs"
-          disabled={disabled}
-          onClick={() => onChange([...rows, { name: "", value: "", enabled: true }])}
-        >
-          + Add
-        </button>
-      </div>
-      <p className="mb-2 text-[11px] leading-relaxed text-muted">
-        Sent alongside auth. These override the defaults on name collision.
-      </p>
-      <div className="flex flex-col gap-2">
-        {rows.map((row, index) => (
-          <div key={`${row.name}-${index}`} className="flex flex-wrap items-center gap-2">
-            <input
-              type="checkbox"
-              checked={row.enabled}
-              disabled={disabled}
-              onChange={(e) =>
-                onChange(
-                  rows.map((entry, i) =>
-                    i === index ? { ...entry, enabled: e.target.checked } : entry,
-                  ),
-                )
-              }
-            />
-            <input
-              className="mb-field h-9 w-40 text-xs"
-              placeholder="Header-Name"
-              value={row.name}
-              disabled={disabled}
-              onChange={(e) =>
-                onChange(
-                  rows.map((entry, i) => (i === index ? { ...entry, name: e.target.value } : entry)),
-                )
-              }
-            />
-            <input
-              className="mb-field h-9 min-w-0 flex-1 text-xs"
-              placeholder="value"
-              value={row.value}
-              disabled={disabled}
-              onChange={(e) =>
-                onChange(
-                  rows.map((entry, i) => (i === index ? { ...entry, value: e.target.value } : entry)),
-                )
-              }
-            />
-            <button
-              type="button"
-              className="mb-btn h-9 px-2 text-xs"
-              disabled={disabled}
-              onClick={() => onChange(rows.filter((_, i) => i !== index))}
-            >
-              ✕
-            </button>
-          </div>
-        ))}
-        {rows.length === 0 ? <p className="text-[11px] text-muted">None.</p> : null}
-      </div>
     </div>
   );
 }
