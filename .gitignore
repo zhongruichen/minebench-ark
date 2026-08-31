@@ -91,7 +91,4 @@ next-env.d.ts
 
 # bench run artifacts
 .bench-out/
-
-# Upstream README media (large, not needed for this fork)
-.github/assets/
 .github/workflows/
